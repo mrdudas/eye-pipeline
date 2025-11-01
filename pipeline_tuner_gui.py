@@ -4,9 +4,6 @@ Interactive Pipeline Tuner GUI
 Interaktív felület a pupilla detektálási pipeline beállításához
 """
 
-import sys
-sys.path.append('./RITnet')
-
 import cv2
 import numpy as np
 import tkinter as tk
@@ -17,12 +14,15 @@ from pathlib import Path
 from threading import Thread
 import json
 from tqdm import tqdm
-import torch
-from models import model_dict
+
+# EllSeg integration (primary detection method)
+from ellseg_integration import EllSegDetector
+
+# Camera calibration
 from camera_calibration import CameraCalibrator
-from iris_model_3d import IrisPupilModel3D
-from iris_model_3d_v2 import EyeballModel3D
-from ellipse_iris_model import EllipseIrisPupilModel
+
+# Iris unwrapping
+from iris_unwrapping import IrisUnwrapper
 
 
 class PipelineTunerGUI:
@@ -32,6 +32,10 @@ class PipelineTunerGUI:
         """GUI inicializálás"""
         self.video_path = video_path
         self.config_path = config_path
+        
+        # Detect dark mode for better color scheme
+        self.is_dark_mode = self._detect_dark_mode()
+        self.info_color = "yellow" if self.is_dark_mode else "blue"
         
         # Videó betöltése
         self.cap = cv2.VideoCapture(video_path)
@@ -48,48 +52,53 @@ class PipelineTunerGUI:
         self.original_frame = None
         self.processed_frame = None
         
+        # Auto-play control
+        self.is_playing = False
+        self.play_interval = 100  # milliseconds (10 fps default)
+        self.play_timer = None
+        
         # Thread lock for video capture
         from threading import Lock
         self.video_lock = Lock()
         
-        # Load RITnet model for eyelid detection
-        print("Loading RITnet model...")
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.ritnet_model = model_dict['densenet']
+        # EllSeg Model for robust ellipse detection
+        print("Loading EllSeg model...")
         try:
-            self.ritnet_model.load_state_dict(torch.load('./RITnet/best_model.pkl', map_location=self.device))
-            self.ritnet_model.to(self.device)
-            self.ritnet_model.eval()
-            self.ritnet_available = True
-            print(f"RITnet loaded successfully on {self.device}")
+            # Auto-detect CUDA/MPS availability
+            import torch
+            if torch.cuda.is_available():
+                device = 'cuda'
+                print(f"🚀 Using NVIDIA GPU: {torch.cuda.get_device_name(0)}")
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                device = 'mps'  # Apple Silicon
+                print("🚀 Using Apple Metal Performance Shaders (MPS)")
+            else:
+                device = 'cpu'
+                print("⚠️  Using CPU (no GPU detected)")
+            
+            self.ellseg_detector = EllSegDetector(device=device)
+            self.ellseg_available = self.ellseg_detector.model is not None
+            if self.ellseg_available:
+                print("✅ EllSeg loaded successfully")
+            else:
+                print("⚠️  EllSeg model not available")
         except Exception as e:
-            print(f"Warning: Could not load RITnet model: {e}")
-            self.ritnet_available = False
+            print(f"Warning: Could not load EllSeg: {e}")
+            self.ellseg_detector = None
+            self.ellseg_available = False
+        
+        # Iris unwrapper
+        self.iris_unwrapper = IrisUnwrapper()
+        self.unwrapped_frontal = None
+        self.unwrapped_polar = None
+        self.unwrap_info = {}
+        print("✅ Iris unwrapper initialized")
         
         # Camera calibration
         self.camera_matrix = None
         self.dist_coeffs = None
         self.calibration_loaded = False
         self.load_camera_calibration()
-        
-        # 3D Iris Models - initialize all three models
-        self.iris_model_original = IrisPupilModel3D(
-            self.width, self.height, 
-            camera_matrix=self.camera_matrix if self.calibration_loaded else None
-        )
-        self.iris_model_sphere = EyeballModel3D(
-            self.width, self.height,
-            camera_matrix=self.camera_matrix if self.calibration_loaded else None
-        )
-        self.iris_model_ellipse = EllipseIrisPupilModel(
-            self.width, self.height
-        )
-        
-        # Current active model (will be set based on dropdown selection)
-        self.iris_model_3d = self.iris_model_original
-        self.current_iris_params = None
-        self.unwrapped_iris = None
-        self.ritnet_mask = None
         
         # GUI létrehozása
         self.create_gui()
@@ -172,13 +181,20 @@ class PipelineTunerGUI:
         ttk.Label(section1, text=f"Total frames: {self.frame_count}").pack()
         ttk.Label(section1, text=f"FPS: {self.fps:.2f}").pack()
         
+        # Frame control with play button
+        frame_control = ttk.Frame(section1)
+        frame_control.pack(pady=5)
+        
+        self.play_button = ttk.Button(frame_control, text="▶ Play", command=self.toggle_play, width=8)
+        self.play_button.pack(side=tk.LEFT, padx=5)
+        
         self.frame_slider = tk.Scale(
-            section1, from_=0, to=self.frame_count-1, 
-            orient=tk.HORIZONTAL, length=350,
+            frame_control, from_=0, to=self.frame_count-1, 
+            orient=tk.HORIZONTAL, length=300,
             label="Frame Number",
             command=self.on_frame_change
         )
-        self.frame_slider.pack(pady=5)
+        self.frame_slider.pack(side=tk.LEFT)
         
         # === 2. GLINT REMOVAL ===
         section2 = ttk.LabelFrame(scrollable_frame, text="2. Glint Removal", padding=10)
@@ -240,102 +256,67 @@ class PipelineTunerGUI:
         self.create_slider(section4, "Tile Size:", self.clahe_tile_size, 4, 32)
         
         # === 5. PUPIL DETECTION ===
-        section5 = ttk.LabelFrame(scrollable_frame, text="5. Pupil Detection (Traditional CV)", padding=10)
+        section5 = ttk.LabelFrame(scrollable_frame, text="5. Pupil & Iris Detection (Traditional CV)", padding=10)
         section5.pack(fill=tk.X, pady=5)
         
+        # Pupil detection
+        ttk.Label(section5, text="Pupil Detection:", font=("Arial", 9, "bold")).pack(anchor=tk.W)
+        
         self.pupil_threshold = tk.IntVar(value=50)
-        self.create_slider(section5, "Threshold:", self.pupil_threshold, 20, 100)
+        self.create_slider(section5, "Pupil Threshold:", self.pupil_threshold, 20, 100)
         
         self.pupil_min_area = tk.IntVar(value=100)
-        self.create_slider(section5, "Min Area:", self.pupil_min_area, 50, 1000)
+        self.create_slider(section5, "Pupil Min Area:", self.pupil_min_area, 50, 1000)
         
         self.pupil_morph_size = tk.IntVar(value=5)
-        self.create_slider(section5, "Morph Kernel:", self.pupil_morph_size, 3, 15)
+        self.create_slider(section5, "Pupil Morph Kernel:", self.pupil_morph_size, 3, 15)
         
-        # === 6. EYELID DETECTION (RITnet) ===
-        section6 = ttk.LabelFrame(scrollable_frame, text="6. Eyelid Detection (RITnet AI)", padding=10)
-        section6.pack(fill=tk.X, pady=5)
+        # Iris detection (NEW!)
+        ttk.Separator(section5, orient='horizontal').pack(fill=tk.X, pady=5)
+        ttk.Label(section5, text="Iris Detection (NEW!):", font=("Arial", 9, "bold"), 
+                 foreground=self.info_color).pack(anchor=tk.W)
         
-        if self.ritnet_available:
-            ttk.Label(section6, text="✅ RITnet Model Loaded", foreground="green").pack()
+        self.iris_enabled = tk.BooleanVar(value=True)
+        ttk.Checkbutton(section5, text="Enable Iris Detection", 
+                       variable=self.iris_enabled,
+                       command=self.update_preview).pack()
+        
+        self.iris_threshold = tk.IntVar(value=80)
+        self.create_slider(section5, "Iris Threshold:", self.iris_threshold, 50, 150)
+        
+        self.iris_min_area = tk.IntVar(value=5000)
+        self.create_slider(section5, "Iris Min Area:", self.iris_min_area, 2000, 20000)
+        
+        self.iris_max_area = tk.IntVar(value=50000)
+        self.create_slider(section5, "Iris Max Area:", self.iris_max_area, 10000, 100000)
+        
+        # === 5.5 ELLSEG ROBUST ELLIPSE DETECTION (NEW!) ===
+        section5_5 = ttk.LabelFrame(scrollable_frame, text="⭐ 5.5. EllSeg Robust Detection (NEW!)", padding=10)
+        section5_5.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(section5_5, text="CNN-based ellipse detection (handles occlusions)", 
+                 foreground=self.info_color, font=("Arial", 9)).pack()
+        
+        if self.ellseg_available:
+            ttk.Label(section5_5, text="✅ EllSeg Model Loaded", foreground="green").pack()
         else:
-            ttk.Label(section6, text="⚠️ RITnet Not Available", foreground="red").pack()
+            ttk.Label(section5_5, text="⚠️  EllSeg not available", foreground="orange").pack()
+            ttk.Label(section5_5, text="Run: bash setup_ellseg.sh", 
+                     font=("Courier", 8)).pack()
         
-        self.eyelid_enabled = tk.BooleanVar(value=True)
-        ttk.Checkbutton(section6, text="Enable Eyelid Detection", 
-                       variable=self.eyelid_enabled,
+        self.ellseg_enabled = tk.BooleanVar(value=True)  # Enabled by default (RECOMMENDED)
+        ttk.Checkbutton(section5_5, text="Enable EllSeg Detection", 
+                       variable=self.ellseg_enabled,
                        command=self.update_preview).pack()
         
-        self.show_segmentation = tk.BooleanVar(value=True)
-        ttk.Checkbutton(section6, text="Show Segmentation Overlay", 
-                       variable=self.show_segmentation,
+        self.ellseg_show_segmentation = tk.BooleanVar(value=True)
+        ttk.Checkbutton(section5_5, text="Show Segmentation Overlay", 
+                       variable=self.ellseg_show_segmentation,
                        command=self.update_preview).pack()
         
-        self.show_eyelid_boundaries = tk.BooleanVar(value=True)
-        ttk.Checkbutton(section6, text="Show Eyelid Boundaries", 
-                       variable=self.show_eyelid_boundaries,
-                       command=self.update_preview).pack()
-        
-        self.show_vertical_axis = tk.BooleanVar(value=True)
-        ttk.Checkbutton(section6, text="Show Vertical Axis", 
-                       variable=self.show_vertical_axis,
-                       command=self.update_preview).pack()
-        
-        # === 7. 3D IRIS MODEL (NEW!) ===
-        section7 = ttk.LabelFrame(scrollable_frame, text="⭐ 7. 3D Iris Model (NEW!)", padding=10)
-        section7.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(section7, text="Fit 3D model to RITnet masks", 
-                 foreground="blue", font=("Arial", 9)).pack()
-        
-        # Model Selection Dropdown
-        model_frame = ttk.Frame(section7)
-        model_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(model_frame, text="Model Type:").pack(side=tk.LEFT, padx=(0, 5))
-        self.iris_model_type = tk.StringVar(value="Ellipse-based (Best)")
-        model_dropdown = ttk.Combobox(model_frame, textvariable=self.iris_model_type, 
-                                      state="readonly", width=25)
-        model_dropdown['values'] = (
-            "Ellipse-based (Best)",
-            "Original (Simple 3D)",
-            "Sphere-based (Physical)"
-        )
-        model_dropdown.pack(side=tk.LEFT, padx=(0, 10))
-        model_dropdown.bind('<<ComboboxSelected>>', self.on_model_type_changed)
-        
-        # Info label for selected model
-        self.model_info_label = tk.StringVar(value="IoU ~1.0, Fast (<0.5s)")
-        ttk.Label(section7, textvariable=self.model_info_label, 
-                 font=("Arial", 8), foreground="darkblue", style="Info.TLabel").pack()
-        
-        self.iris_model_enabled = tk.BooleanVar(value=True)
-        ttk.Checkbutton(section7, text="Enable 3D Iris Model", 
-                       variable=self.iris_model_enabled,
-                       command=self.update_preview).pack()
-        
-        self.show_iris_overlay = tk.BooleanVar(value=True)
-        ttk.Checkbutton(section7, text="Show Model Overlay", 
-                       variable=self.show_iris_overlay,
-                       command=self.update_preview).pack()
-        
-        self.show_unwrapped = tk.BooleanVar(value=True)
-        ttk.Checkbutton(section7, text="Show Unwrapped Iris", 
-                       variable=self.show_unwrapped,
-                       command=self.update_preview).pack()
-        
-        # Model parameters display
-        self.iris_params_label = tk.StringVar(value="No model fitted yet")
-        ttk.Label(section7, textvariable=self.iris_params_label, 
+        self.ellseg_info_label = tk.StringVar(value="EllSeg not enabled")
+        ttk.Label(section5_5, textvariable=self.ellseg_info_label, 
                  font=("Courier", 8), foreground="darkgreen").pack()
-        
-        self.optimization_method = tk.StringVar(value="de")
-        opt_frame = ttk.Frame(section7)
-        opt_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(opt_frame, text="Optimization:").pack(side=tk.LEFT)
-        ttk.Radiobutton(opt_frame, text="Fast (Nelder-Mead)", 
-                       variable=self.optimization_method, value="nelder-mead").pack(side=tk.LEFT)
-        ttk.Radiobutton(opt_frame, text="Accurate (DE)", 
-                       variable=self.optimization_method, value="de").pack(side=tk.LEFT)
         
         # === ACTION BUTTONS ===
         action_frame = ttk.Frame(scrollable_frame)
@@ -344,11 +325,17 @@ class PipelineTunerGUI:
         ttk.Button(action_frame, text="🔄 Update Preview", 
                   command=self.update_preview).pack(fill=tk.X, pady=2)
         
+        ttk.Button(action_frame, text="🔍 Show Transformation Steps", 
+                  command=self.show_transformation_steps).pack(fill=tk.X, pady=2)
+        
         ttk.Button(action_frame, text="🧪 Test on 50 Frames", 
                   command=lambda: self.run_test(50)).pack(fill=tk.X, pady=2)
         
         ttk.Button(action_frame, text="🧪 Test on 100 Frames", 
                   command=lambda: self.run_test(100)).pack(fill=tk.X, pady=2)
+        
+        ttk.Button(action_frame, text="🎬 Process Full Video", 
+                  command=self.process_full_video).pack(fill=tk.X, pady=2)
         
         # Last video path
         self.last_video_path = None
@@ -366,7 +353,7 @@ class PipelineTunerGUI:
         # Status
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(scrollable_frame, textvariable=self.status_var, 
-                 foreground="blue", font=("Arial", 10, "bold")).pack(pady=10)
+                 foreground=self.info_color, font=("Arial", 10, "bold")).pack(pady=10)
     
     def create_slider(self, parent, label, variable, from_, to, resolution=1):
         """Slider létrehozása címkével"""
@@ -412,17 +399,39 @@ class PipelineTunerGUI:
         self.result_canvas = tk.Canvas(right_frame, bg="black")
         self.result_canvas.pack(fill=tk.BOTH, expand=True)
         
-        # Alsó sor: Unwrapped Iris (NEW!)
-        bottom_frame = ttk.LabelFrame(parent, text="⭐ Unwrapped Iris (Frontal View)")
-        bottom_frame.pack(fill=tk.BOTH, expand=True)
-        self.unwrapped_canvas = tk.Canvas(bottom_frame, bg="black")
-        self.unwrapped_canvas.pack(fill=tk.BOTH, expand=True)
+        # === BOTTOM ROW: Iris Frontal View ===
+        bottom_frame = ttk.Frame(parent)
+        bottom_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        
+        # Frontal view (unwrapped circular iris with pupil measurements)
+        frontal_frame = ttk.LabelFrame(bottom_frame, text="�️ Iris Frontal View (Perspective Corrected)")
+        frontal_frame.pack(fill=tk.BOTH, expand=True)
+        self.frontal_canvas = tk.Canvas(frontal_frame, bg="black")
+        self.frontal_canvas.pack(fill=tk.BOTH, expand=True)
     
     def on_frame_change(self, value):
         """Frame slider változás"""
         frame_num = int(float(value))
         self.load_frame(frame_num)
         self.update_preview()
+    
+    def _detect_dark_mode(self):
+        """Detect if system is in dark mode"""
+        try:
+            import subprocess
+            import platform
+            
+            if platform.system() == 'Darwin':  # macOS
+                result = subprocess.run(
+                    ['defaults', 'read', '-g', 'AppleInterfaceStyle'],
+                    capture_output=True,
+                    text=True
+                )
+                return 'Dark' in result.stdout
+            # Linux/Windows - default to light mode detection
+            return False
+        except:
+            return False
     
     def load_frame(self, frame_num):
         """Frame betöltése thread-safe módon"""
@@ -523,281 +532,422 @@ class PipelineTunerGUI:
         return result
     
     def detect_pupil_traditional(self, frame):
-        """Hagyományos CV pupilla detektálás - JAVÍTOTT"""
+        """Hagyományos CV pupilla ÉS iris detektálás"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Threshold
+        annotated = frame.copy()
+        pupil_data = None
+        iris_data = None
+        
+        # === PUPIL DETECTION ===
         threshold = self.pupil_threshold.get()
-        _, binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
+        _, binary_pupil = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)
         
         # Morphology
         kernel_size = self.pupil_morph_size.get()
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        binary_pupil = cv2.morphologyEx(binary_pupil, cv2.MORPH_OPEN, kernel)
+        binary_pupil = cv2.morphologyEx(binary_pupil, cv2.MORPH_CLOSE, kernel)
         
         # Contours
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        annotated = frame.copy()
-        pupil_data = None
+        contours_pupil, _ = cv2.findContours(binary_pupil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         # Filter by area
         min_area = self.pupil_min_area.get()
-        valid_contours = [c for c in contours if cv2.contourArea(c) >= min_area]
+        valid_contours = [c for c in contours_pupil if cv2.contourArea(c) >= min_area]
         
         if valid_contours:
             largest = max(valid_contours, key=cv2.contourArea)
             
             if len(largest) >= 5:
                 ellipse = cv2.fitEllipse(largest)
-                cv2.ellipse(annotated, ellipse, (0, 255, 0), 2)
+                cv2.ellipse(annotated, ellipse, (0, 0, 255), 2)  # Red for pupil
                 
                 center = tuple(map(int, ellipse[0]))
-                cv2.circle(annotated, center, 5, (0, 0, 255), -1)
+                cv2.circle(annotated, center, 3, (0, 0, 255), -1)
                 
                 pupil_data = {
                     'center': center,
                     'axes': ellipse[1],
-                    'angle': ellipse[2]
+                    'angle': ellipse[2],
+                    'area': cv2.contourArea(largest)
                 }
                 
-                cv2.putText(annotated, "Pupil Detected", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(annotated, f"D: {ellipse[1][0]:.1f}px", (10, 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(annotated, "Pupil", (center[0] + 10, center[1] - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        
+        # === IRIS DETECTION (NEW!) ===
+        if self.iris_enabled.get():
+            iris_threshold = self.iris_threshold.get()
+            _, binary_iris = cv2.threshold(gray, iris_threshold, 255, cv2.THRESH_BINARY_INV)
+            
+            # Larger morphology for iris
+            kernel_iris = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            binary_iris = cv2.morphologyEx(binary_iris, cv2.MORPH_OPEN, kernel_iris)
+            binary_iris = cv2.morphologyEx(binary_iris, cv2.MORPH_CLOSE, kernel_iris)
+            
+            # Find contours
+            contours_iris, _ = cv2.findContours(binary_iris, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Filter by area (iris is bigger than pupil)
+            min_iris_area = self.iris_min_area.get()
+            max_iris_area = self.iris_max_area.get()
+            valid_iris = [c for c in contours_iris 
+                         if min_iris_area <= cv2.contourArea(c) <= max_iris_area]
+            
+            if valid_iris:
+                # If we have pupil, find iris that contains it
+                if pupil_data is not None:
+                    pupil_center = pupil_data['center']
+                    best_iris = None
+                    best_dist = float('inf')
+                    
+                    for c in valid_iris:
+                        if len(c) >= 5:
+                            ellipse_iris = cv2.fitEllipse(c)
+                            iris_center = tuple(map(int, ellipse_iris[0]))
+                            dist = np.sqrt((iris_center[0] - pupil_center[0])**2 + 
+                                         (iris_center[1] - pupil_center[1])**2)
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_iris = (c, ellipse_iris)
+                    
+                    if best_iris is not None and best_dist < 50:  # Max 50px distance
+                        contour, ellipse_iris = best_iris
+                        cv2.ellipse(annotated, ellipse_iris, (0, 255, 0), 2)  # Green for iris
+                        
+                        iris_center = tuple(map(int, ellipse_iris[0]))
+                        
+                        iris_data = {
+                            'center': iris_center,
+                            'axes': ellipse_iris[1],
+                            'angle': ellipse_iris[2],
+                            'area': cv2.contourArea(contour)
+                        }
+                        
+                        cv2.putText(annotated, "Iris", (iris_center[0] + 10, iris_center[1] + 20),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                else:
+                    # No pupil, just take largest iris candidate
+                    largest_iris = max(valid_iris, key=cv2.contourArea)
+                    if len(largest_iris) >= 5:
+                        ellipse_iris = cv2.fitEllipse(largest_iris)
+                        cv2.ellipse(annotated, ellipse_iris, (0, 255, 0), 2)
+                        
+                        iris_center = tuple(map(int, ellipse_iris[0]))
+                        
+                        iris_data = {
+                            'center': iris_center,
+                            'axes': ellipse_iris[1],
+                            'angle': ellipse_iris[2],
+                            'area': cv2.contourArea(largest_iris)
+                        }
+        
+        # Status display
+        status_y = 30
+        if pupil_data:
+            cv2.putText(annotated, f"Pupil: {pupil_data['axes'][0]:.1f}x{pupil_data['axes'][1]:.1f}px", 
+                       (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            status_y += 25
         else:
-            cv2.putText(annotated, "No pupil detected", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(annotated, "No pupil detected", (10, status_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            status_y += 25
         
-        return annotated, pupil_data
+        if iris_data:
+            cv2.putText(annotated, f"Iris: {iris_data['axes'][0]:.1f}x{iris_data['axes'][1]:.1f}px", 
+                       (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            # Show ratio
+            if pupil_data:
+                ratio = pupil_data['axes'][0] / iris_data['axes'][0]
+                cv2.putText(annotated, f"P/I Ratio: {ratio:.2f}", 
+                           (10, status_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        elif self.iris_enabled.get():
+            cv2.putText(annotated, "No iris detected", (10, status_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        return annotated, pupil_data, iris_data
     
-    def preprocess_for_ritnet(self, frame):
+    def detect_eye_corners(self, frame, pupil_data=None, iris_data=None):
         """
-        Preprocess frame for RITnet inference
-        1. Gamma correction (0.8)
-        2. CLAHE (clipLimit=1.5, tileGridSize=(8,8))
-        3. Normalization (mean=0.5, std=0.5)
-        4. Resize to 640x400
+        Detect eye corners (inner and outer canthus) using corner detection
+        Returns frame with annotations and corner data
         """
-        # Convert to grayscale
-        if len(frame.shape) == 3:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = frame.copy()
+        if not self.eye_corners_enabled.get():
+            self.corner_info_label.set("Eye corners detection disabled")
+            return frame, None
         
-        # Gamma correction
-        gamma = 0.8
-        inv_gamma = 1.0 / gamma
-        table = np.array([((i / 255.0) ** inv_gamma) * 255
-                         for i in np.arange(0, 256)]).astype("uint8")
-        gray = cv2.LUT(gray, table)
+        annotated = frame.copy()
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame.copy()
         
-        # CLAHE
-        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
-        gray = clahe.apply(gray)
+        # Parameters
+        quality_level = self.corner_quality.get()
+        min_distance = self.corner_min_distance.get()
+        method = self.corner_method.get()
         
-        # Resize to 640x400
-        resized = cv2.resize(gray, (640, 400))
+        corners_data = None
         
-        # Normalize
-        normalized = (resized / 255.0 - 0.5) / 0.5
+        try:
+            if method == "shi-tomasi":
+                # Shi-Tomasi corner detection (goodFeaturesToTrack)
+                corners = cv2.goodFeaturesToTrack(
+                    gray,
+                    maxCorners=20,
+                    qualityLevel=quality_level,
+                    minDistance=min_distance,
+                    blockSize=7
+                )
+            else:  # harris
+                # Harris corner detection
+                gray_float = np.float32(gray)
+                harris = cv2.cornerHarris(gray_float, blockSize=7, ksize=5, k=0.04)
+                harris = cv2.dilate(harris, None)
+                
+                # Threshold
+                threshold = quality_level * harris.max()
+                corner_coords = np.argwhere(harris > threshold)
+                
+                # Convert to goodFeaturesToTrack format
+                if len(corner_coords) > 0:
+                    corners = corner_coords[:, ::-1].astype(np.float32).reshape(-1, 1, 2)
+                else:
+                    corners = None
+            
+            if corners is not None and len(corners) >= 2:
+                # Convert to regular array
+                corners = corners.reshape(-1, 2)
+                
+                # Find leftmost and rightmost corners (eye corners are horizontal extremes)
+                left_idx = np.argmin(corners[:, 0])
+                right_idx = np.argmax(corners[:, 0])
+                
+                left_corner = tuple(corners[left_idx].astype(int))
+                right_corner = tuple(corners[right_idx].astype(int))
+                
+                # Calculate horizontal axis
+                center_x = (left_corner[0] + right_corner[0]) // 2
+                center_y = (left_corner[1] + right_corner[1]) // 2
+                center = (center_x, center_y)
+                
+                # Calculate angle and distance
+                dx = right_corner[0] - left_corner[0]
+                dy = right_corner[1] - left_corner[1]
+                angle = np.degrees(np.arctan2(dy, dx))
+                eye_width = np.sqrt(dx**2 + dy**2)
+                
+                corners_data = {
+                    'left': left_corner,
+                    'right': right_corner,
+                    'center': center,
+                    'angle': angle,
+                    'eye_width': eye_width
+                }
+                
+                # Draw corners
+                cv2.circle(annotated, left_corner, 5, (255, 0, 0), -1)  # Blue for left
+                cv2.circle(annotated, right_corner, 5, (255, 0, 0), -1)  # Blue for right
+                cv2.putText(annotated, "L", (left_corner[0] - 15, left_corner[1] - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                cv2.putText(annotated, "R", (right_corner[0] + 10, right_corner[1] - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                
+                # Draw horizontal axis
+                if self.show_horizontal_axis.get():
+                    cv2.line(annotated, left_corner, right_corner, (0, 255, 255), 2)  # Yellow line
+                    cv2.circle(annotated, center, 4, (255, 255, 0), -1)  # Cyan center
+                    
+                    # Display info
+                    info_y = frame.shape[0] - 80
+                    cv2.putText(annotated, f"Eye axis: {angle:.1f}deg", 
+                               (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    cv2.putText(annotated, f"Eye width: {eye_width:.1f}px", 
+                               (10, info_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                
+                # Update info label
+                self.corner_info_label.set(
+                    f"L=({left_corner[0]},{left_corner[1]}) R=({right_corner[0]},{right_corner[1]}) | "
+                    f"Width={eye_width:.1f}px Angle={angle:.1f}°"
+                )
+                
+            else:
+                self.corner_info_label.set("Not enough corners detected (need at least 2)")
+                cv2.putText(annotated, "No eye corners detected", 
+                           (10, frame.shape[0] - 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         
-        # Convert to tensor: [1, 1, 400, 640]
-        tensor = torch.from_numpy(normalized).float().unsqueeze(0).unsqueeze(0)
+        except Exception as e:
+            print(f"Error in eye corners detection: {e}")
+            import traceback
+            traceback.print_exc()
+            self.corner_info_label.set(f"Error: {str(e)[:50]}")
+            cv2.putText(annotated, f"Corner Error: {str(e)[:30]}", 
+                       (10, frame.shape[0] - 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
         
-        return tensor
+        return annotated, corners_data
     
-    def detect_eyelids_ritnet(self, frame, pupil_data=None):
+    def detect_ellseg(self, frame):
         """
-        Detect eyelids using RITnet semantic segmentation
-        Returns frame with annotations, eyelid data, and segmentation mask
+        Detect pupil and iris ellipses using EllSeg CNN model
+        Returns frame with annotations and ellipse data
         """
-        if not self.eyelid_enabled.get() or not self.ritnet_available:
+        if not self.ellseg_enabled.get():
+            self.ellseg_info_label.set("EllSeg disabled")
+            return frame, None, None
+        
+        if not self.ellseg_available or self.ellseg_detector is None:
+            self.ellseg_info_label.set("⚠️  EllSeg model not loaded")
+            cv2.putText(frame, "EllSeg not available", 
+                       (10, frame.shape[0] - 100),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
             return frame, None, None
         
         annotated = frame.copy()
-        original_size = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame.copy()
         
         try:
-            # Preprocess for RITnet
-            input_tensor = self.preprocess_for_ritnet(frame)
-            input_tensor = input_tensor.to(self.device)
+            # Run EllSeg detection
+            results = self.ellseg_detector.detect(gray)
             
-            # Inference
-            with torch.no_grad():
-                output = self.ritnet_model(input_tensor)
+            pupil_ellipse = results['pupil_ellipse']
+            iris_ellipse = results['iris_ellipse']
+            seg_map = results['seg_map']
+            confidence = results['confidence']
             
-            # Get segmentation mask
-            pred = torch.argmax(output, dim=1).squeeze(0).cpu().numpy()
+            # Show segmentation overlay if enabled
+            if self.ellseg_show_segmentation.get():
+                overlay = annotated.copy()
+                overlay[seg_map == 1] = [0, 255, 0]    # Iris = green
+                overlay[seg_map == 2] = [255, 255, 0]  # Pupil = yellow
+                annotated = cv2.addWeighted(annotated, 0.7, overlay, 0.3, 0)
             
-            # Resize back to original size
-            mask = cv2.resize(pred.astype(np.uint8), 
-                            (original_size[1], original_size[0]),
-                            interpolation=cv2.INTER_NEAREST)
+            # Draw pupil ellipse (red)
+            if not np.all(pupil_ellipse == -1):
+                cx, cy, a, b, angle = pupil_ellipse
+                cv2.ellipse(annotated, 
+                           (int(cx), int(cy)), 
+                           (int(a), int(b)), 
+                           np.rad2deg(angle), 
+                           0, 360, (0, 0, 255), 2)
+                cv2.circle(annotated, (int(cx), int(cy)), 3, (0, 0, 255), -1)
+                cv2.putText(annotated, "Pupil (EllSeg)", 
+                           (int(cx) + 10, int(cy) - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
             
-            # Show segmentation overlay
-            if self.show_segmentation.get():
-                colored_mask = np.zeros((*mask.shape, 3), dtype=np.uint8)
-                colored_mask[mask == 1] = [255, 0, 0]    # Sclera: Red
-                colored_mask[mask == 2] = [0, 255, 0]    # Iris: Green
-                colored_mask[mask == 3] = [0, 0, 255]    # Pupil: Blue
-                annotated = cv2.addWeighted(annotated, 0.7, colored_mask, 0.3, 0)
+            # Draw iris ellipse (green)
+            if not np.all(iris_ellipse == -1):
+                cx, cy, a, b, angle = iris_ellipse
+                cv2.ellipse(annotated, 
+                           (int(cx), int(cy)), 
+                           (int(a), int(b)), 
+                           np.rad2deg(angle), 
+                           0, 360, (0, 255, 0), 2)
+                cv2.putText(annotated, "Iris (EllSeg)", 
+                           (int(cx) + 10, int(cy) + 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
             
-            # Extract eyelid boundaries
-            eyelid_data = {}
+            # Display confidence
+            info_y = frame.shape[0] - 120
+            cv2.putText(annotated, f"EllSeg Confidence: {confidence:.2f}", 
+                       (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
-            # Find eye region (non-background)
-            eye_region = (mask > 0).astype(np.uint8) * 255
-            contours, _ = cv2.findContours(eye_region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # Format pupil/iris data for compatibility with existing code
+            pupil_data = None
+            iris_data = None
             
-            if contours:
-                # Get largest contour (main eye region)
-                largest_contour = max(contours, key=cv2.contourArea)
-                
-                # Find topmost and bottommost points (eyelid boundaries)
-                topmost = tuple(largest_contour[largest_contour[:, :, 1].argmin()][0])
-                bottommost = tuple(largest_contour[largest_contour[:, :, 1].argmax()][0])
-                leftmost = tuple(largest_contour[largest_contour[:, :, 0].argmin()][0])
-                rightmost = tuple(largest_contour[largest_contour[:, :, 0].argmax()][0])
-                
-                eyelid_data = {
-                    'upper': topmost,
-                    'lower': bottommost,
-                    'left': leftmost,
-                    'right': rightmost
+            if not np.all(pupil_ellipse == -1):
+                cx, cy, a, b, angle = pupil_ellipse
+                pupil_data = {
+                    'center': (int(cx), int(cy)),
+                    'ellipse': ((cx, cy), (2*a, 2*b), np.rad2deg(angle)),
+                    'radius': (a + b) / 2,
+                    'area': np.pi * a * b,
+                    'source': 'ellseg'
                 }
-                
-                # Draw eyelid boundaries
-                if self.show_eyelid_boundaries.get():
-                    cv2.circle(annotated, topmost, 5, (0, 255, 255), -1)
-                    cv2.circle(annotated, bottommost, 5, (0, 255, 255), -1)
-                    cv2.putText(annotated, "Upper", (topmost[0]+10, topmost[1]), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                    cv2.putText(annotated, "Lower", (bottommost[0]+10, bottommost[1]), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                
-                # Draw vertical axis
-                if self.show_vertical_axis.get():
-                    cv2.line(annotated, topmost, bottommost, (255, 255, 0), 2)
-                    
-                    # Eye center point
-                    eye_center_y = (topmost[1] + bottommost[1]) // 2
-                    eye_center_x = (leftmost[0] + rightmost[0]) // 2
-                    cv2.circle(annotated, (eye_center_x, eye_center_y), 5, (255, 0, 255), -1)
-                    
-                    # Eye height
-                    eye_height = bottommost[1] - topmost[1]
-                    cv2.putText(annotated, f"Eye height: {eye_height}px", (10, 90),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                
-                # If pupil is detected, show relative position
-                if pupil_data and pupil_data.get('center'):
-                    pupil_y = pupil_data['center'][1]
-                    relative_pos = (pupil_y - topmost[1]) / (bottommost[1] - topmost[1])
-                    cv2.putText(annotated, f"Pupil Y pos: {relative_pos:.2f}", (10, 120),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             
-            # Store mask for 3D model fitting
-            self.ritnet_mask = mask
+            if not np.all(iris_ellipse == -1):
+                cx, cy, a, b, angle = iris_ellipse
+                iris_data = {
+                    'center': (int(cx), int(cy)),
+                    'ellipse': ((cx, cy), (2*a, 2*b), np.rad2deg(angle)),
+                    'radius': (a + b) / 2,
+                    'area': np.pi * a * b,
+                    'source': 'ellseg'
+                }
             
-            return annotated, eyelid_data, mask
-            
-        except Exception as e:
-            print(f"Error in RITnet detection: {e}")
-            cv2.putText(annotated, f"RITnet Error: {str(e)[:30]}", (10, 90),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-            return annotated, None, None
-    
-    def fit_3d_iris_model(self, frame, preprocessed, ritnet_mask):
-        """
-        Fit 3D iris-pupil model to RITnet segmentation mask
-        Returns frame with model overlay and unwrapped iris display
-        """
-        if not self.iris_model_enabled.get() or ritnet_mask is None:
-            self.current_iris_params = None
-            self.unwrapped_iris = None
-            self.iris_params_label.set("3D model disabled")
-            return frame
-        
-        annotated = frame.copy()
-        
-        try:
-            # Fit 3D model to mask
-            params = self.iris_model_3d.fit_to_mask(
-                ritnet_mask, 
-                method=self.optimization_method.get()
+            # Update info label
+            pupil_pixels = np.sum(seg_map == 2)
+            iris_pixels = np.sum(seg_map == 1)
+            self.ellseg_info_label.set(
+                f"Conf={confidence:.2f} | P_pix={pupil_pixels} I_pix={iris_pixels}"
             )
             
-            self.current_iris_params = params
+            # Store ellipses for transformation steps visualization
+            self.last_iris_ellipse = iris_ellipse if not np.all(iris_ellipse == -1) else None
+            self.last_pupil_ellipse = pupil_ellipse if not np.all(pupil_ellipse == -1) else None
             
-            # Update parameter display
-            param_text = (f"θ={params['theta_deg']:.1f}° φ={params['phi_deg']:.1f}° | "
-                         f"r_pupil={params['r_pupil']:.1f} r_iris={params['r_iris']:.1f} | "
-                         f"IoU: P={params['iou_pupil']:.2f} I={params['iou_iris']:.2f}")
-            self.iris_params_label.set(param_text)
-            
-            # Draw model overlay
-            if self.show_iris_overlay.get():
-                # Draw iris boundary (green)
-                iris_3d = self.iris_model_3d.generate_circle_points(
-                    params['r_iris'], num_points=100
-                )
-                iris_2d = self.iris_model_3d.project_to_image(
-                    iris_3d, params['theta'], params['phi'],
-                    params['cx'], params['cy'], params['distance']
-                )
-                iris_2d = iris_2d[~np.isnan(iris_2d).any(axis=1)]
-                if len(iris_2d) > 2:
-                    iris_contour = iris_2d.astype(np.int32).reshape((-1, 1, 2))
-                    cv2.polylines(annotated, [iris_contour], True, (0, 255, 0), 2)
-                
-                # Draw pupil boundary (blue)
-                pupil_3d = self.iris_model_3d.generate_circle_points(
-                    params['r_pupil'], num_points=100
-                )
-                pupil_2d = self.iris_model_3d.project_to_image(
-                    pupil_3d, params['theta'], params['phi'],
-                    params['cx'], params['cy'], params['distance']
-                )
-                pupil_2d = pupil_2d[~np.isnan(pupil_2d).any(axis=1)]
-                if len(pupil_2d) > 2:
-                    pupil_contour = pupil_2d.astype(np.int32).reshape((-1, 1, 2))
-                    cv2.polylines(annotated, [pupil_contour], True, (255, 0, 0), 2)
-                
-                # Draw center
-                cv2.circle(annotated, (int(params['cx']), int(params['cy'])), 
-                          5, (0, 255, 255), -1)
-                
-                # Draw rotation angles
-                cv2.putText(annotated, f"Pitch: {params['theta_deg']:.1f}deg", 
-                           (10, frame.shape[0] - 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                cv2.putText(annotated, f"Yaw: {params['phi_deg']:.1f}deg", 
-                           (10, frame.shape[0] - 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            
-            # Generate unwrapped iris
-            if self.show_unwrapped.get():
-                self.unwrapped_iris = self.iris_model_3d.unwrap_iris(
-                    preprocessed, params, output_size=(256, 64)
-                )
+            # IRIS PROCESSING (NEW!)
+            # Get frontal view and pupil measurements
+            if not np.all(iris_ellipse == -1):
+                try:
+                    results = self.iris_unwrapper.process_iris(
+                        gray, 
+                        iris_ellipse,
+                        pupil_ellipse if not np.all(pupil_ellipse == -1) else iris_ellipse
+                    )
+                    
+                    # Store for display
+                    self.unwrapped_frontal = results['frontal_view']
+                    self.unwrapped_polar = None  # No longer used
+                    
+                    # Combine all measurement info
+                    self.unwrap_info = {
+                        **results['frontal_info'],
+                        'iris_ellipse_frontal': results.get('iris_ellipse_frontal'),
+                        'pupil_ellipse_frontal': results.get('pupil_ellipse_frontal')
+                    }
+                    
+                    # Add pupil measurements
+                    if results['pupil_from_ellipse']:
+                        self.unwrap_info['pupil_ellipse'] = results['pupil_from_ellipse']
+                    if results['pupil_from_frontal']:
+                        self.unwrap_info['pupil_frontal'] = results['pupil_from_frontal']
+                    
+                    # Add viewing angle and pupil size to display
+                    y_info = info_y + 25
+                    if 'viewing_angle_deg' in results['frontal_info']:
+                        angle_deg = results['frontal_info']['viewing_angle_deg']
+                        cv2.putText(annotated, f"View: {angle_deg:.1f}deg", 
+                                   (10, y_info), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+                        y_info += 20
+                    
+                    # Add pupil measurements
+                    if results['pupil_from_ellipse']:
+                        pupil_mm = results['pupil_from_ellipse']['pupil_diameter_mm']
+                        cv2.putText(annotated, f"Pupil: {pupil_mm:.2f}mm", 
+                                   (10, y_info), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+                        
+                except Exception as e:
+                    print(f"Iris processing error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    self.unwrapped_frontal = None
+                    self.unwrapped_polar = None
             else:
-                self.unwrapped_iris = None
+                self.unwrapped_frontal = None
+                self.unwrapped_polar = None
             
-            return annotated
+            return annotated, pupil_data, iris_data
             
         except Exception as e:
-            print(f"Error in 3D iris model fitting: {e}")
+            print(f"EllSeg detection error: {e}")
             import traceback
             traceback.print_exc()
-            cv2.putText(annotated, f"3D Model Error: {str(e)[:40]}", 
-                       (10, frame.shape[0] - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-            self.current_iris_params = None
-            self.unwrapped_iris = None
-            self.iris_params_label.set(f"Error: {str(e)[:50]}")
-            return annotated
+            self.ellseg_info_label.set(f"Error: {str(e)[:30]}")
+            return frame, None, None
     
     def update_preview(self, *args):
         """Előnézet frissítése"""
@@ -810,32 +960,92 @@ class PipelineTunerGUI:
         # Preprocessing
         preprocessed = self.preprocess_frame(self.original_frame)
         
-        # Pupil Detection
-        result, pupil_data = self.detect_pupil_traditional(preprocessed)
+        # Store preprocessed frame for transformation steps visualization
+        self.preprocessed_frame = preprocessed
         
-        # Eyelid Detection (RITnet) - returns mask as well
-        result, eyelid_data, ritnet_mask = self.detect_eyelids_ritnet(result, pupil_data)
-        
-        # 3D Iris Model (NEW!)
-        result = self.fit_3d_iris_model(result, preprocessed, ritnet_mask)
+        # Pupil & Iris Detection (Traditional CV or EllSeg)
+        if self.ellseg_enabled.get() and self.ellseg_available:
+            # Use EllSeg for robust detection (RECOMMENDED)
+            result, pupil_data, iris_data = self.detect_ellseg(preprocessed)
+        else:
+            # Use traditional CV methods
+            result, pupil_data, iris_data = self.detect_pupil_traditional(preprocessed)
         
         # Display
         self.display_image(self.original_frame, self.original_canvas)
         self.display_image(preprocessed, self.preprocessed_canvas)
         self.display_image(result, self.result_canvas)
         
-        # Display unwrapped iris if available
-        if self.unwrapped_iris is not None and self.show_unwrapped.get():
-            self.display_image(self.unwrapped_iris, self.unwrapped_canvas)
+        # Display unwrapped views (if available)
+        if self.unwrapped_frontal is not None:
+            # Draw ellipses on frontal view if available
+            frontal_display = self.unwrapped_frontal.copy()
+            
+            # Check if we have transformed ellipses
+            if hasattr(self, 'unwrap_info') and self.unwrap_info:
+                iris_ellipse_frontal = self.unwrap_info.get('iris_ellipse_frontal')
+                pupil_ellipse_frontal = self.unwrap_info.get('pupil_ellipse_frontal')
+                pupil_frontal = self.unwrap_info.get('pupil_frontal')
+                
+                # Convert to BGR for color drawing
+                if len(frontal_display.shape) == 2:
+                    frontal_display = cv2.cvtColor(frontal_display, cv2.COLOR_GRAY2BGR)
+                
+                # Draw iris ellipse (green)
+                if iris_ellipse_frontal is not None:
+                    # Format: ((cx, cy), (width, height), angle_deg) from OpenCV
+                    if isinstance(iris_ellipse_frontal, tuple) and len(iris_ellipse_frontal) == 3:
+                        center, axes, angle = iris_ellipse_frontal
+                        cv2.ellipse(frontal_display, 
+                                   (int(center[0]), int(center[1])), 
+                                   (int(axes[0]/2), int(axes[1]/2)),
+                                   angle, 0, 360, (0, 255, 0), 2)
+                    elif len(iris_ellipse_frontal) >= 5:
+                        cx, cy, a, b, angle = iris_ellipse_frontal
+                        cv2.ellipse(frontal_display, 
+                                   (int(cx), int(cy)), 
+                                   (int(a), int(b)),
+                                   np.rad2deg(angle), 0, 360, (0, 255, 0), 2)
+                
+                # Draw pupil ellipse (blue)
+                if pupil_ellipse_frontal is not None:
+                    # Format: ((cx, cy), (width, height), angle_deg) from OpenCV
+                    if isinstance(pupil_ellipse_frontal, tuple) and len(pupil_ellipse_frontal) == 3:
+                        center, axes, angle = pupil_ellipse_frontal
+                        cv2.ellipse(frontal_display, 
+                                   (int(center[0]), int(center[1])), 
+                                   (int(axes[0]/2), int(axes[1]/2)),
+                                   angle, 0, 360, (255, 0, 0), 2)
+                    elif len(pupil_ellipse_frontal) >= 5:
+                        cx, cy, a, b, angle = pupil_ellipse_frontal
+                        cv2.ellipse(frontal_display, 
+                                   (int(cx), int(cy)), 
+                                   (int(a), int(b)),
+                                   np.rad2deg(angle), 0, 360, (255, 0, 0), 2)
+                
+                # Add pupil measurements text
+                if pupil_frontal:
+                    # Main measurement: diameter from area (pixels only)
+                    text = f"Pupil D: {pupil_frontal['pupil_diameter_from_area_px']:.1f}px"
+                    cv2.putText(frontal_display, text, (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    
+                    # Additional info: area
+                    if 'pupil_area_px' in pupil_frontal:
+                        text_area = f"Area: {pupil_frontal['pupil_area_px']:.0f}px^2"
+                        cv2.putText(frontal_display, text_area, (10, 60),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                        
+                        # Axes if available
+                        if 'pupil_major_axis_px' in pupil_frontal:
+                            text_axes = f"Axes: {pupil_frontal['pupil_major_axis_px']:.1f} x {pupil_frontal['pupil_minor_axis_px']:.1f}"
+                            cv2.putText(frontal_display, text_axes, (10, 85),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            
+            self.display_image(frontal_display, self.frontal_canvas)
         else:
-            # Clear unwrapped canvas
-            self.unwrapped_canvas.delete("all")
-            self.unwrapped_canvas.create_text(
-                self.unwrapped_canvas.winfo_width()//2, 
-                self.unwrapped_canvas.winfo_height()//2,
-                text="Unwrapped iris disabled or not available",
-                fill="gray", font=("Arial", 12)
-            )
+            # Clear canvas
+            self.frontal_canvas.delete("all")
         
         self.status_var.set(f"Frame {self.current_frame_num}/{self.frame_count-1}")
     
@@ -890,17 +1100,24 @@ class PipelineTunerGUI:
         output_file = output_dir / f"test_frames_{start_frame}_to_{end_frame-1}.mp4"
         
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        # Side-by-side: original + result (2x width)
-        out = cv2.VideoWriter(str(output_file), fourcc, self.fps, (self.width * 2, self.height))
+        # Three views side-by-side: original + detection result + frontal view
+        # Frontal view is 400x400, so we need to resize it to match height
+        frontal_width = int(400 * self.height / 400)  # Scale to match height
+        out = cv2.VideoWriter(str(output_file), fourcc, self.fps, (self.width * 2 + frontal_width, self.height))
         
         detected_count = 0
         
         # Külön videó capture a thread számára
         test_cap = cv2.VideoCapture(self.video_path)
         
+        # Seek to start frame once
+        test_cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        
         try:
-            for frame_num in range(start_frame, end_frame):
-                test_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            for idx in range(num_frames):
+                frame_num = start_frame + idx
+                
+                # Linear read (no seeking) - much faster!
                 ret, frame = test_cap.read()
                 
                 if not ret:
@@ -910,11 +1127,11 @@ class PipelineTunerGUI:
                 # Preprocess
                 preprocessed = self.preprocess_frame(frame)
                 
-                # Detect pupil
-                result_frame, pupil_data = self.detect_pupil_traditional(preprocessed)
-                
-                # Detect eyelids with RITnet
-                result_frame, eyelid_data = self.detect_eyelids_ritnet(result_frame, pupil_data)
+                # Detect pupil & iris (use EllSeg if available, else Traditional CV)
+                if self.ellseg_available and self.ellseg_enabled.get():
+                    result_frame, pupil_data, iris_data = self.detect_ellseg(preprocessed)
+                else:
+                    result_frame, pupil_data, iris_data = self.detect_pupil_traditional(preprocessed)
                 
                 # Check detection
                 detected = pupil_data is not None
@@ -940,18 +1157,38 @@ class PipelineTunerGUI:
                 cv2.putText(result_frame, f"Rate: {current_rate:.1f}%", (10, self.height - 50),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 
-                # Side-by-side: original + detection result
-                combined = np.hstack([info_frame, result_frame])
+                # Prepare frontal view (resize to match height)
+                if self.unwrapped_frontal is not None:
+                    # Convert grayscale to BGR if needed
+                    if len(self.unwrapped_frontal.shape) == 2:
+                        frontal_bgr = cv2.cvtColor(self.unwrapped_frontal, cv2.COLOR_GRAY2BGR)
+                    else:
+                        frontal_bgr = self.unwrapped_frontal
+                    
+                    frontal_resized = cv2.resize(frontal_bgr, (frontal_width, self.height))
+                    # Add label
+                    cv2.putText(frontal_resized, "Frontal View", (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                else:
+                    # Create black placeholder if no frontal view
+                    frontal_resized = np.zeros((self.height, frontal_width, 3), dtype=np.uint8)
+                    cv2.putText(frontal_resized, "No frontal view", (10, self.height // 2),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
+                
+                # Three views side-by-side: original + detection result + frontal
+                combined = np.hstack([info_frame, result_frame, frontal_resized])
                 out.write(combined)
                 
-                # Update status
-                progress = (frame_num - start_frame + 1) / num_frames * 100
-                self.root.after(0, lambda p=progress, d=detected_count, f=frame_num-start_frame+1: 
-                              self.status_var.set(f"Creating video: {p:.0f}% ({d}/{f} detected)"))
+                # Update status every 5 frames (reduce GUI overhead)
+                if idx % 5 == 0:
+                    progress = (idx + 1) / num_frames * 100
+                    self.root.after(0, lambda p=progress, d=detected_count, f=idx+1: 
+                                  self.status_var.set(f"Creating video: {p:.0f}% ({d}/{f} detected)"))
         
         except Exception as e:
             print(f"Error during test: {e}")
-            self.root.after(0, lambda: self.status_var.set(f"Error: {e}"))
+            error_msg = str(e)
+            self.root.after(0, lambda msg=error_msg: self.status_var.set(f"Error: {msg}"))
         
         finally:
             out.release()
@@ -1009,6 +1246,165 @@ class PipelineTunerGUI:
         except Exception as e:
             messagebox.showerror("Error", f"Could not open video: {e}")
     
+    def process_full_video(self):
+        """Teljes videó feldolgozása"""
+        # Confirmation dialog
+        result = messagebox.askquestion(
+            "Process Full Video",
+            f"This will process all {self.frame_count} frames.\n\n"
+            f"This may take a while depending on video length.\n\n"
+            f"Continue?",
+            icon='warning'
+        )
+        
+        if result != 'yes':
+            return
+        
+        self.status_var.set(f"Processing full video ({self.frame_count} frames)...")
+        self.root.update()
+        
+        # Run in thread
+        thread = Thread(target=self._process_full_video_thread)
+        thread.start()
+    
+    def _process_full_video_thread(self):
+        """Teljes videó feldolgozása thread-ben - OPTIMIZED"""
+        total_frames = self.frame_count
+        results = []
+        
+        # Output video setup
+        output_dir = Path("output")
+        output_dir.mkdir(exist_ok=True)
+        
+        video_name = Path(self.video_path).stem
+        output_file = output_dir / f"{video_name}_processed.mp4"
+        
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        # Three views side-by-side: original + detection result + frontal view
+        # Frontal view is 400x400, so we need to resize it to match height
+        frontal_width = int(400 * self.height / 400)  # Scale to match height
+        out = cv2.VideoWriter(str(output_file), fourcc, self.fps, (self.width * 2 + frontal_width, self.height))
+        
+        detected_count = 0
+        
+        # Separate video capture for thread - NO SEEKING, linear read
+        process_cap = cv2.VideoCapture(self.video_path)
+        
+        # Batch size for processing
+        BATCH_SIZE = 32  # Process multiple frames before writing
+        frame_batch = []
+        
+        try:
+            frame_num = 0
+            while frame_num < total_frames:
+                # Read frame (linear, no seek - much faster!)
+                ret, frame = process_cap.read()
+                
+                if not ret:
+                    print(f"Warning: Failed to read frame {frame_num}")
+                    break
+                
+                # Preprocess
+                preprocessed = self.preprocess_frame(frame)
+                
+                # Detect pupil & iris (use EllSeg if available, else Traditional CV)
+                if self.ellseg_available and self.ellseg_enabled.get():
+                    result_frame, pupil_data, iris_data = self.detect_ellseg(preprocessed)
+                else:
+                    result_frame, pupil_data, iris_data = self.detect_pupil_traditional(preprocessed)
+                
+                # Check detection
+                detected = pupil_data is not None
+                
+                results.append(detected)
+                if detected:
+                    detected_count += 1
+                
+                # Frame info on original
+                info_frame = frame.copy()
+                cv2.putText(info_frame, f"Frame: {frame_num}/{total_frames}", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(info_frame, f"Original", (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                
+                # Detection status on result frame
+                status_color = (0, 255, 0) if detected else (0, 0, 255)
+                status_text = "DETECTED" if detected else "NOT DETECTED"
+                cv2.putText(result_frame, status_text, (10, self.height - 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+                
+                current_rate = (detected_count / (frame_num + 1)) * 100
+                cv2.putText(result_frame, f"Rate: {current_rate:.1f}%", (10, self.height - 50),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                # Prepare frontal view (resize to match height)
+                if self.unwrapped_frontal is not None:
+                    # Convert grayscale to BGR if needed
+                    if len(self.unwrapped_frontal.shape) == 2:
+                        frontal_bgr = cv2.cvtColor(self.unwrapped_frontal, cv2.COLOR_GRAY2BGR)
+                    else:
+                        frontal_bgr = self.unwrapped_frontal
+                    
+                    frontal_resized = cv2.resize(frontal_bgr, (frontal_width, self.height))
+                    # Add label
+                    cv2.putText(frontal_resized, "Frontal View", (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                else:
+                    # Create black placeholder if no frontal view
+                    frontal_resized = np.zeros((self.height, frontal_width, 3), dtype=np.uint8)
+                    cv2.putText(frontal_resized, "No frontal view", (10, self.height // 2),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
+                
+                # Three views side-by-side: original + detection result + frontal
+                combined = np.hstack([info_frame, result_frame, frontal_resized])
+                
+                # Write immediately (no batching for video I/O - it's already buffered)
+                out.write(combined)
+                
+                # Update status every 30 frames (reduce GUI overhead)
+                if frame_num % 30 == 0:
+                    progress = (frame_num + 1) / total_frames * 100
+                    self.root.after(0, lambda p=progress, d=detected_count, f=frame_num+1: 
+                                  self.status_var.set(f"Processing: {p:.1f}% ({d}/{f} detected)"))
+                
+                frame_num += 1
+        
+        except Exception as e:
+            print(f"Error during processing: {e}")
+            import traceback
+            traceback.print_exc()
+            self.root.after(0, lambda e=e: self.status_var.set(f"Error: {e}"))
+        
+        finally:
+            out.release()
+            process_cap.release()
+        
+        # Calculate statistics
+        detection_rate = sum(results) / len(results) * 100 if results else 0
+        
+        # Show result
+        self.root.after(0, lambda: self.show_full_video_results(detection_rate, len(results), output_file))
+        self.root.after(0, lambda: self.status_var.set(f"✅ Full video processed: {output_file.name}"))
+    
+    def show_full_video_results(self, detection_rate, num_frames, video_path):
+        """Teljes videó feldolgozás eredmények megjelenítése"""
+        # Enable open video button
+        self.last_video_path = video_path
+        self.open_video_btn.config(state='normal')
+        
+        result = messagebox.askquestion(
+            "Full Video Processing Complete",
+            f"Processed {num_frames} frames\n\n"
+            f"Detection Rate: {detection_rate:.1f}%\n"
+            f"Detected: {int(detection_rate * num_frames / 100)}/{num_frames} frames\n\n"
+            f"Video saved: {video_path}\n\n"
+            f"Open video now?",
+            icon='info'
+        )
+        
+        if result == 'yes':
+            self.open_video(video_path)
+    
     def save_settings(self):
         """Beállítások mentése"""
         settings = {
@@ -1038,11 +1434,9 @@ class PipelineTunerGUI:
                 'min_area': self.pupil_min_area.get(),
                 'morph_kernel': self.pupil_morph_size.get()
             },
-            'eyelid': {
-                'enabled': self.eyelid_enabled.get(),
-                'show_segmentation': self.show_segmentation.get(),
-                'show_boundaries': self.show_eyelid_boundaries.get(),
-                'show_vertical_axis': self.show_vertical_axis.get()
+            'ellseg': {
+                'enabled': self.ellseg_enabled.get(),
+                'show_segmentation': self.ellseg_show_segmentation.get()
             }
         }
         
@@ -1086,12 +1480,10 @@ class PipelineTunerGUI:
                 self.pupil_min_area.set(settings['pupil']['min_area'])
                 self.pupil_morph_size.set(settings['pupil']['morph_kernel'])
             
-            # Eyelid
-            if 'eyelid' in settings:
-                self.eyelid_enabled.set(settings['eyelid']['enabled'])
-                self.show_segmentation.set(settings['eyelid']['show_segmentation'])
-                self.show_eyelid_boundaries.set(settings['eyelid']['show_boundaries'])
-                self.show_vertical_axis.set(settings['eyelid']['show_vertical_axis'])
+            # EllSeg
+            if 'ellseg' in settings:
+                self.ellseg_enabled.set(settings['ellseg']['enabled'])
+                self.ellseg_show_segmentation.set(settings['ellseg']['show_segmentation'])
             
             self.update_preview()
             messagebox.showinfo("Loaded", "Settings loaded successfully")
@@ -1099,30 +1491,6 @@ class PipelineTunerGUI:
             
         except FileNotFoundError:
             messagebox.showerror("Error", "pipeline_settings.yaml not found")
-    
-    def on_model_type_changed(self, event=None):
-        """
-        Handle model type dropdown change
-        """
-        model_type = self.iris_model_type.get()
-        
-        if model_type == "Ellipse-based (Best)":
-            self.iris_model_3d = self.iris_model_ellipse
-            self.model_info_label.set("IoU ~1.0, Fast (<0.5s), Direct ellipse fitting")
-        elif model_type == "Original (Simple 3D)":
-            self.iris_model_3d = self.iris_model_original
-            self.model_info_label.set("IoU ~0.97, Medium (2-3s), Simplified 3D projection")
-        elif model_type == "Sphere-based (Physical)":
-            self.iris_model_3d = self.iris_model_sphere
-            self.model_info_label.set("IoU ~0.4-0.7, Slow (3-4s), Physical eyeball sphere")
-        
-        # Clear cached results
-        self.current_iris_params = None
-        self.unwrapped_iris = None
-        
-        # Update preview with new model
-        if self.iris_model_enabled.get():
-            self.update_preview()
     
     def load_camera_calibration(self, filename="camera_calibration.yaml"):
         """
@@ -1304,11 +1672,149 @@ class PipelineTunerGUI:
         """GUI futtatása"""
         self.root.mainloop()
     
+    def toggle_play(self):
+        """Toggle auto-play of frames"""
+        if self.is_playing:
+            self.stop_play()
+        else:
+            self.start_play()
+    
+    def start_play(self):
+        """Start auto-playing frames"""
+        self.is_playing = True
+        self.play_button.config(text="⏸ Pause")
+        self.advance_frame()
+    
+    def stop_play(self):
+        """Stop auto-playing frames"""
+        self.is_playing = False
+        self.play_button.config(text="▶ Play")
+        if self.play_timer is not None:
+            self.root.after_cancel(self.play_timer)
+            self.play_timer = None
+    
+    def advance_frame(self):
+        """Advance to next frame during auto-play"""
+        if not self.is_playing:
+            return
+        
+        # Move to next frame
+        current = self.frame_slider.get()
+        if current < self.frame_count - 1:
+            self.frame_slider.set(current + 1)
+            # Schedule next frame
+            self.play_timer = self.root.after(self.play_interval, self.advance_frame)
+        else:
+            # Reached end, stop playing
+            self.stop_play()
+    
     def cleanup(self):
         """Cleanup"""
+        # Stop auto-play if running
+        if self.is_playing:
+            self.stop_play()
+        
         if hasattr(self, 'cap') and self.cap is not None:
             self.cap.release()
         cv2.destroyAllWindows()
+    
+    def show_transformation_steps(self):
+        """Show all 6 transformation steps in a new window"""
+        # Check if we have a frame loaded
+        if not hasattr(self, 'original_frame') or self.original_frame is None:
+            messagebox.showwarning("No Frame", "Please load a video and navigate to a frame first!")
+            return
+        
+        # Check if we have preprocessed frame from last preview
+        if not hasattr(self, 'preprocessed_frame') or self.preprocessed_frame is None:
+            messagebox.showwarning("No Preview", "Please click 'Update Preview' first to detect ellipses!")
+            return
+        
+        # Check if we have detection results
+        if not hasattr(self, 'last_iris_ellipse') or not hasattr(self, 'last_pupil_ellipse'):
+            messagebox.showwarning("No Detection", "Please click 'Update Preview' first to detect ellipses!")
+            return
+        
+        if self.last_iris_ellipse is None or self.last_pupil_ellipse is None:
+            messagebox.showwarning("No Detection", "No iris/pupil detected in current frame!")
+            return
+        
+        # Use the preprocessed frame and ellipses from last detection
+        preprocessed = self.preprocessed_frame
+        
+        # Convert to grayscale if needed
+        if len(preprocessed.shape) == 3:
+            gray = cv2.cvtColor(preprocessed, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = preprocessed
+        
+        iris_ellipse = self.last_iris_ellipse
+        pupil_ellipse = self.last_pupil_ellipse
+        
+        try:
+            # Get transformation steps
+            steps = self.iris_unwrapper.visualize_transformation_steps(
+                gray, iris_ellipse, pupil_ellipse
+            )
+            
+            # Create new window
+            steps_window = tk.Toplevel(self.root)
+            steps_window.title("🔍 Transformation Steps (6 Steps)")
+            steps_window.geometry("1200x800")
+            
+            # Create scrollable frame
+            canvas = tk.Canvas(steps_window)
+            scrollbar = ttk.Scrollbar(steps_window, orient="vertical", command=canvas.yview)
+            scrollable_frame = ttk.Frame(canvas)
+            
+            scrollable_frame.bind(
+                "<Configure>",
+                lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+            )
+            
+            canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            
+            # Grid layout: 3 columns
+            for idx, step in enumerate(steps):
+                row = idx // 3
+                col = idx % 3
+                
+                frame = ttk.LabelFrame(scrollable_frame, text=step['title'])
+                frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+                
+                # Resize image to fit
+                img = step['image']
+                img_resized = cv2.resize(img, (350, 350))
+                img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+                img_pil = Image.fromarray(img_rgb)
+                img_tk = ImageTk.PhotoImage(img_pil)
+                
+                label = ttk.Label(frame, image=img_tk)
+                label.image = img_tk  # Keep reference
+                label.pack(padx=5, pady=5)
+                
+                # Add ellipse info
+                if step['iris_ellipse']:
+                    center, axes, angle = step['iris_ellipse']
+                    info_text = f"Iris: {axes[0]/2:.0f}x{axes[1]/2:.0f}px"
+                    ttk.Label(frame, text=info_text, foreground='green').pack()
+                if step['pupil_ellipse']:
+                    center, axes, angle = step['pupil_ellipse']
+                    info_text = f"Pupil: {axes[0]/2:.0f}x{axes[1]/2:.0f}px"
+                    ttk.Label(frame, text=info_text, foreground='blue').pack()
+            
+            # Configure grid weights
+            for i in range(3):
+                scrollable_frame.columnconfigure(i, weight=1)
+            
+            canvas.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to generate steps:\n{e}")
+            import traceback
+            traceback.print_exc()
 
 
 def main():

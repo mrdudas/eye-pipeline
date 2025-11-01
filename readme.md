@@ -20,11 +20,21 @@ Accurate pupil detection and tracking pipeline for Near-IR eye tracking video (e
    - **Step 2**: Glint Removal (threshold, area, morphology)
    - **Step 3**: Noise Reduction (bilateral/gaussian/median)
    - **Step 4**: CLAHE (contrast enhancement)
-   - **Step 5**: Pupil Detection (traditional CV)
+   - **Step 5**: Pupil & Iris Detection (traditional CV)
+   - **Step 5.5**: **EllSeg Robust Detection (CNN-based)** ⭐ NEW!
    - **Step 6**: Eyelid Detection (RITnet AI)
-   - **Step 7**: 3D Iris Model (orientation & unwrapping) ⭐ NEW!
+   - **Step 7**: 3D Iris Model (orientation & unwrapping)
 
-3. **RITnet Integration**
+3. **EllSeg Integration** ⭐ NEW!
+   - **CNN-based robust ellipse detection** for pupil & iris
+   - **Handles eyelid occlusions** (vertical axis problem solved!)
+   - DenseNet2D (RITnet_v3) architecture
+   - Pre-trained on OpenEDS, RITEyes, LPW, NVGaze
+   - Outputs: Segmentation map + ellipse parameters
+   - 10%+ pupil center, 24%+ iris center improvement
+   - See [ELLSEG_INTEGRATION.md](ELLSEG_INTEGRATION.md) for details
+
+4. **RITnet Integration**
    - Semantic segmentation (sclera, iris, pupil)
    - Eyelid boundary detection
    - Vertical axis determination
@@ -39,12 +49,16 @@ Accurate pupil detection and tracking pipeline for Near-IR eye tracking video (e
    - Real-time undistortion
 
 5. **3D Iris Model** ⭐ NEW!
+   - **Three model implementations** with GUI selection:
+     - **Ellipse-based (Recommended)**: Direct ellipse fitting, IoU ~1.0, <0.5s ⭐
+     - **Original (Simple 3D)**: Simplified 3D projection, IoU ~0.97, 2-3s
+     - **Sphere-based (Physical)**: Full eyeball model, IoU ~0.4-0.7, 3-4s
    - Fit 3D concentric circles (pupil + iris) to RITnet masks
    - Estimate 3D orientation: pitch (θ) and yaw (φ) angles
    - Perspective projection with camera matrix
    - Iris unwrapping to frontal view (256×64 polar coordinates)
-   - 0.97 IoU accuracy, ~2-3 seconds per frame
    - Applications: gaze estimation, iris recognition, quality assessment
+   - **Model Comparison**: See [MODEL_COMPARISON.md](MODEL_COMPARISON.md)
 
 6. **Video Generation**
    - Side-by-side original|detection output
@@ -77,14 +91,15 @@ python pipeline_tuner_gui.py
 
 ## Documentation
 
-- **[IRIS_3D_MODEL.md](IRIS_3D_MODEL.md)** - 3D iris-pupil model and unwrapping ⭐ NEW!
+- **[ELLSEG_INTEGRATION.md](ELLSEG_INTEGRATION.md)** - EllSeg robust detection (handles occlusions) ⭐ NEW!
+- **[MODEL_COMPARISON.md](MODEL_COMPARISON.md)** - Comparison of 3 iris model implementations
+- **[IRIS_3D_MODEL.md](IRIS_3D_MODEL.md)** - Original 3D iris-pupil model documentation
 - **[CAMERA_CALIBRATION.md](CAMERA_CALIBRATION.md)** - Camera calibration and undistortion
 - **[RITNET_INTEGRATION.md](RITNET_INTEGRATION.md)** - RITnet eyelid detection setup and usage
 - **[EYELID_DETECTION_RESEARCH.md](EYELID_DETECTION_RESEARCH.md)** - Model comparison and research
 - **[VIDEO_GENERATION_GUIDE.md](VIDEO_GENERATION_GUIDE.md)** - Video testing feature
 - **[GUI_USAGE_GUIDE.md](GUI_USAGE_GUIDE.md)** - GUI usage instructions
 - **[SETUP_GUIDE.md](SETUP_GUIDE.md)** - Installation and setup instructions
-- **[EYE_CORNERS_DETECTION.md](EYE_CORNERS_DETECTION.md)** - Eye corners (deprecated)
 
 ## Architecture
 
@@ -101,7 +116,12 @@ Step 3: Noise Reduction
     ↓
 Step 4: CLAHE Enhancement
     ↓
-Step 5: Pupil Detection (Traditional CV)
+Step 5: Pupil & Iris Detection (Traditional CV)
+    ↓
+Step 5.5: EllSeg Robust Detection (CNN) ⭐ NEW!
+    ├── Segmentation (iris/pupil masks)
+    ├── Ellipse regression
+    └── Handles eyelid occlusions
     ↓
 Step 6: Eyelid Detection (RITnet AI)
     ↓
@@ -190,7 +210,8 @@ Validáció és QA
 ✅ **GUI**: Production ready  
 ✅ **Camera Calibration**: Integrated (0.18px error)  
 ✅ **RITnet**: Integrated and tested  
-✅ **3D Iris Model**: Integrated (0.97 IoU) ⭐ NEW!  
+✅ **EllSeg**: Integrated (robust occlusion handling) ⭐ NEW!  
+✅ **3D Iris Model**: 3 implementations with GUI selection  
 ✅ **Video Generation**: Working  
 ⏳ **Full Video Processing**: In progress  
 ⏳ **mm Accuracy Conversion**: Planned  
@@ -198,4 +219,4 @@ Validáció és QA
 ---
 
 **Last Updated**: 2025-11-01  
-**Version**: 1.2 (3D Iris Model + Camera Calibration + RITnet Integration)
+**Version**: 1.4 (EllSeg Integration for Occlusion Handling)
