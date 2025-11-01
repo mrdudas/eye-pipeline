@@ -9,7 +9,7 @@ sys.path.append('./RITnet')
 import cv2
 import numpy as np
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
 import yaml
 from pathlib import Path
@@ -18,6 +18,7 @@ import json
 from tqdm import tqdm
 import torch
 from models import model_dict
+from camera_calibration import CameraCalibrator
 
 
 class PipelineTunerGUI:
@@ -60,6 +61,12 @@ class PipelineTunerGUI:
         except Exception as e:
             print(f"Warning: Could not load RITnet model: {e}")
             self.ritnet_available = False
+        
+        # Camera calibration
+        self.camera_matrix = None
+        self.dist_coeffs = None
+        self.calibration_loaded = False
+        self.load_camera_calibration()
         
         # GUI létrehozása
         self.create_gui()
@@ -110,6 +117,30 @@ class PipelineTunerGUI:
         
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+        
+        # === 0. CAMERA CALIBRATION ===
+        section0 = ttk.LabelFrame(scrollable_frame, text="0. Camera Undistortion", padding=10)
+        section0.pack(fill=tk.X, pady=5)
+        
+        if self.calibration_loaded:
+            ttk.Label(section0, text="✅ Calibration Loaded", foreground="green").pack()
+            ttk.Label(section0, text=f"fx={self.camera_matrix[0,0]:.1f}, fy={self.camera_matrix[1,1]:.1f}",
+                     font=("Courier", 9)).pack()
+        else:
+            ttk.Label(section0, text="⚠️ No Calibration", foreground="orange").pack()
+        
+        self.undistort_enabled = tk.BooleanVar(value=self.calibration_loaded)
+        ttk.Checkbutton(section0, text="Enable Undistortion", 
+                       variable=self.undistort_enabled,
+                       command=self.update_preview).pack()
+        
+        calibration_btn_frame = ttk.Frame(section0)
+        calibration_btn_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(calibration_btn_frame, text="📹 Run Calibration", 
+                  command=self.run_calibration_dialog).pack(side=tk.LEFT, padx=2)
+        ttk.Button(calibration_btn_frame, text="📂 Load Calibration", 
+                  command=self.load_calibration_dialog).pack(side=tk.LEFT, padx=2)
         
         # === 1. IMAGE SELECTION ===
         section1 = ttk.LabelFrame(scrollable_frame, text="1. Image Selection", padding=10)
@@ -323,6 +354,9 @@ class PipelineTunerGUI:
     def preprocess_frame(self, frame):
         """Frame előfeldolgozása a beállítások alapján"""
         processed = frame.copy()
+        
+        # 0. Camera undistortion (FIRST!)
+        processed = self.undistort_frame(processed)
         
         # 1. Glint removal
         if self.glint_enabled.get():
@@ -784,6 +818,10 @@ class PipelineTunerGUI:
     def save_settings(self):
         """Beállítások mentése"""
         settings = {
+            'camera': {
+                'undistort_enabled': self.undistort_enabled.get(),
+                'calibration_file': 'camera_calibration.yaml' if self.calibration_loaded else None
+            },
             'glint': {
                 'enabled': self.glint_enabled.get(),
                 'threshold': self.glint_threshold.get(),
@@ -827,6 +865,10 @@ class PipelineTunerGUI:
             with open("pipeline_settings.yaml", 'r', encoding='utf-8') as f:
                 settings = yaml.safe_load(f)
             
+            # Camera
+            if 'camera' in settings:
+                self.undistort_enabled.set(settings['camera'].get('undistort_enabled', False))
+            
             # Glint
             self.glint_enabled.set(settings['glint']['enabled'])
             self.glint_threshold.set(settings['glint']['threshold'])
@@ -863,6 +905,182 @@ class PipelineTunerGUI:
             
         except FileNotFoundError:
             messagebox.showerror("Error", "pipeline_settings.yaml not found")
+    
+    def load_camera_calibration(self, filename="camera_calibration.yaml"):
+        """
+        Kamera kalibráció betöltése
+        """
+        try:
+            self.camera_matrix, self.dist_coeffs = CameraCalibrator.load_calibration(filename)
+            self.calibration_loaded = True
+            print(f"✅ Camera calibration loaded from {filename}")
+        except FileNotFoundError:
+            print(f"⚠️  No calibration file found: {filename}")
+            self.calibration_loaded = False
+        except Exception as e:
+            print(f"❌ Error loading calibration: {e}")
+            self.calibration_loaded = False
+    
+    def run_calibration_dialog(self):
+        """
+        Kalibráció futtatása - dialog
+        """
+        # File selection dialog
+        video_file = filedialog.askopenfilename(
+            title="Select Calibration Video",
+            filetypes=[
+                ("Video files", "*.mp4 *.avi *.mkv *.mov"),
+                ("All files", "*.*")
+            ],
+            initialfile="eye_cam.mkv"
+        )
+        
+        if not video_file:
+            return
+        
+        # Chessboard size dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Calibration Settings")
+        dialog.geometry("400x250")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        ttk.Label(dialog, text="Chessboard Configuration", 
+                 font=("Helvetica", 14, "bold")).pack(pady=10)
+        
+        # Chessboard size
+        size_frame = ttk.Frame(dialog)
+        size_frame.pack(pady=10)
+        
+        ttk.Label(size_frame, text="Columns (inner corners):").grid(row=0, column=0, sticky=tk.W, padx=5)
+        cols_var = tk.IntVar(value=9)
+        ttk.Spinbox(size_frame, from_=3, to=20, textvariable=cols_var, width=10).grid(row=0, column=1, padx=5)
+        
+        ttk.Label(size_frame, text="Rows (inner corners):").grid(row=1, column=0, sticky=tk.W, padx=5)
+        rows_var = tk.IntVar(value=6)
+        ttk.Spinbox(size_frame, from_=3, to=20, textvariable=rows_var, width=10).grid(row=1, column=1, padx=5)
+        
+        ttk.Label(size_frame, text="Square size (mm):").grid(row=2, column=0, sticky=tk.W, padx=5)
+        square_var = tk.DoubleVar(value=1.0)
+        ttk.Spinbox(size_frame, from_=0.1, to=100, textvariable=square_var, 
+                   width=10, increment=0.1).grid(row=2, column=1, padx=5)
+        
+        # Max frames
+        ttk.Label(size_frame, text="Max frames to use:").grid(row=3, column=0, sticky=tk.W, padx=5)
+        frames_var = tk.IntVar(value=30)
+        ttk.Spinbox(size_frame, from_=10, to=100, textvariable=frames_var, width=10).grid(row=3, column=1, padx=5)
+        
+        result = {"run": False}
+        
+        def on_ok():
+            result["run"] = True
+            result["cols"] = cols_var.get()
+            result["rows"] = rows_var.get()
+            result["square"] = square_var.get()
+            result["frames"] = frames_var.get()
+            dialog.destroy()
+        
+        def on_cancel():
+            dialog.destroy()
+        
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=20)
+        
+        ttk.Button(btn_frame, text="Run Calibration", command=on_ok).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=5)
+        
+        dialog.wait_window()
+        
+        if not result["run"]:
+            return
+        
+        # Run calibration in thread
+        def calibration_thread():
+            self.status_var.set("Running calibration...")
+            self.root.update()
+            
+            calibrator = CameraCalibrator(
+                chessboard_size=(result["cols"], result["rows"]),
+                square_size_mm=result["square"]
+            )
+            
+            success, info = calibrator.calibrate_from_video(
+                video_file,
+                max_frames=result["frames"],
+                show_detection=False
+            )
+            
+            if success:
+                # Save calibration
+                output_file = "camera_calibration.yaml"
+                calibrator.save_calibration(output_file)
+                
+                # Load into GUI
+                self.camera_matrix = calibrator.camera_matrix
+                self.dist_coeffs = calibrator.dist_coeffs
+                self.calibration_loaded = True
+                self.undistort_enabled.set(True)
+                
+                self.status_var.set(f"Calibration complete! Error: {info['reprojection_error_px']:.3f}px")
+                messagebox.showinfo("Success", 
+                                  f"Calibration successful!\n\n"
+                                  f"Reprojection error: {info['reprojection_error_px']:.3f} px\n"
+                                  f"Frames used: {info['frames_used']}\n"
+                                  f"Saved to: {output_file}")
+                
+                # Update preview
+                self.update_preview()
+            else:
+                self.status_var.set("Calibration failed!")
+                messagebox.showerror("Error", 
+                                   f"Calibration failed!\n\n{info.get('error', 'Unknown error')}")
+        
+        Thread(target=calibration_thread, daemon=True).start()
+    
+    def load_calibration_dialog(self):
+        """
+        Kalibráció betöltése file-ból
+        """
+        filename = filedialog.askopenfilename(
+            title="Load Calibration File",
+            filetypes=[
+                ("YAML files", "*.yaml *.yml"),
+                ("All files", "*.*")
+            ],
+            initialfile="camera_calibration.yaml"
+        )
+        
+        if not filename:
+            return
+        
+        try:
+            self.camera_matrix, self.dist_coeffs = CameraCalibrator.load_calibration(filename)
+            self.calibration_loaded = True
+            self.undistort_enabled.set(True)
+            
+            messagebox.showinfo("Success", f"Calibration loaded from:\n{filename}")
+            self.status_var.set(f"Calibration loaded from {Path(filename).name}")
+            
+            # Update preview
+            self.update_preview()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load calibration:\n{str(e)}")
+    
+    def undistort_frame(self, frame):
+        """
+        Frame undistort ha enabled és van kalibráció
+        """
+        if not self.undistort_enabled.get():
+            return frame
+        
+        if not self.calibration_loaded or self.camera_matrix is None:
+            return frame
+        
+        try:
+            return cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
+        except Exception as e:
+            print(f"Undistort error: {e}")
+            return frame
     
     def run(self):
         """GUI futtatása"""
