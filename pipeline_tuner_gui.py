@@ -21,6 +21,8 @@ import torch
 from models import model_dict
 from camera_calibration import CameraCalibrator
 from iris_model_3d import IrisPupilModel3D
+from iris_model_3d_v2 import EyeballModel3D
+from ellipse_iris_model import EllipseIrisPupilModel
 
 
 class PipelineTunerGUI:
@@ -70,11 +72,21 @@ class PipelineTunerGUI:
         self.calibration_loaded = False
         self.load_camera_calibration()
         
-        # 3D Iris Model
-        self.iris_model_3d = IrisPupilModel3D(
+        # 3D Iris Models - initialize all three models
+        self.iris_model_original = IrisPupilModel3D(
             self.width, self.height, 
             camera_matrix=self.camera_matrix if self.calibration_loaded else None
         )
+        self.iris_model_sphere = EyeballModel3D(
+            self.width, self.height,
+            camera_matrix=self.camera_matrix if self.calibration_loaded else None
+        )
+        self.iris_model_ellipse = EllipseIrisPupilModel(
+            self.width, self.height
+        )
+        
+        # Current active model (will be set based on dropdown selection)
+        self.iris_model_3d = self.iris_model_original
         self.current_iris_params = None
         self.unwrapped_iris = None
         self.ritnet_mask = None
@@ -275,6 +287,26 @@ class PipelineTunerGUI:
         
         ttk.Label(section7, text="Fit 3D model to RITnet masks", 
                  foreground="blue", font=("Arial", 9)).pack()
+        
+        # Model Selection Dropdown
+        model_frame = ttk.Frame(section7)
+        model_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(model_frame, text="Model Type:").pack(side=tk.LEFT, padx=(0, 5))
+        self.iris_model_type = tk.StringVar(value="Ellipse-based (Best)")
+        model_dropdown = ttk.Combobox(model_frame, textvariable=self.iris_model_type, 
+                                      state="readonly", width=25)
+        model_dropdown['values'] = (
+            "Ellipse-based (Best)",
+            "Original (Simple 3D)",
+            "Sphere-based (Physical)"
+        )
+        model_dropdown.pack(side=tk.LEFT, padx=(0, 10))
+        model_dropdown.bind('<<ComboboxSelected>>', self.on_model_type_changed)
+        
+        # Info label for selected model
+        self.model_info_label = tk.StringVar(value="IoU ~1.0, Fast (<0.5s)")
+        ttk.Label(section7, textvariable=self.model_info_label, 
+                 font=("Arial", 8), foreground="darkblue", style="Info.TLabel").pack()
         
         self.iris_model_enabled = tk.BooleanVar(value=True)
         ttk.Checkbutton(section7, text="Enable 3D Iris Model", 
@@ -1067,6 +1099,30 @@ class PipelineTunerGUI:
             
         except FileNotFoundError:
             messagebox.showerror("Error", "pipeline_settings.yaml not found")
+    
+    def on_model_type_changed(self, event=None):
+        """
+        Handle model type dropdown change
+        """
+        model_type = self.iris_model_type.get()
+        
+        if model_type == "Ellipse-based (Best)":
+            self.iris_model_3d = self.iris_model_ellipse
+            self.model_info_label.set("IoU ~1.0, Fast (<0.5s), Direct ellipse fitting")
+        elif model_type == "Original (Simple 3D)":
+            self.iris_model_3d = self.iris_model_original
+            self.model_info_label.set("IoU ~0.97, Medium (2-3s), Simplified 3D projection")
+        elif model_type == "Sphere-based (Physical)":
+            self.iris_model_3d = self.iris_model_sphere
+            self.model_info_label.set("IoU ~0.4-0.7, Slow (3-4s), Physical eyeball sphere")
+        
+        # Clear cached results
+        self.current_iris_params = None
+        self.unwrapped_iris = None
+        
+        # Update preview with new model
+        if self.iris_model_enabled.get():
+            self.update_preview()
     
     def load_camera_calibration(self, filename="camera_calibration.yaml"):
         """
