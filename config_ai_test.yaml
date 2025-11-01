@@ -1,0 +1,49 @@
+calibration:
+  cx: null
+  cy: null
+  distortion_coeffs: []
+  enabled: false
+  fx: null
+  fy: null
+output:
+  output_dir: output
+  save_annotated: true
+  save_data: true
+  save_frames: true
+  show_preview: false
+preprocessing:
+  clahe:
+    clip_limit: 2.0
+    enabled: true
+    tile_grid_size:
+    - 8
+    - 8
+  glint_removal:
+    enabled: true
+    inpainting: true
+    inpainting_method: telea
+    inpainting_radius: 3
+    max_area: 200
+    min_area: 5
+    min_circularity: 0.3
+    morph_iterations: 3
+    morph_kernel_size: 3
+    threshold: 240
+pupil_detection:
+  blob:
+    circularity: 0.5
+    max_area: 5000
+    max_threshold: 200
+    min_area: 50
+    min_threshold: 10
+  canny:
+    high_threshold: 100
+    low_threshold: 30
+  ellipse:
+    min_samples: 5
+    ransac_iterations: 1000
+    ransac_threshold: 2.0
+video:
+  end_frame: 50
+  input_path: eye1.mp4
+  start_frame: 0
