@@ -15,13 +15,14 @@ Accurate pupil detection and tracking pipeline for Near-IR eye tracking video (e
    - Settings save/load (YAML)
 
 2. **Pipeline Steps**
-   - **Step 0**: Camera Undistortion (geometric correction) ⭐ NEW
+   - **Step 0**: Camera Undistortion (geometric correction)
    - **Step 1**: Image Selection (frame slider)
    - **Step 2**: Glint Removal (threshold, area, morphology)
    - **Step 3**: Noise Reduction (bilateral/gaussian/median)
    - **Step 4**: CLAHE (contrast enhancement)
    - **Step 5**: Pupil Detection (traditional CV)
    - **Step 6**: Eyelid Detection (RITnet AI)
+   - **Step 7**: 3D Iris Model (orientation & unwrapping) ⭐ NEW!
 
 3. **RITnet Integration**
    - Semantic segmentation (sclera, iris, pupil)
@@ -30,14 +31,22 @@ Accurate pupil detection and tracking pipeline for Near-IR eye tracking video (e
    - 95%+ accuracy, 100+ fps
    - Near-IR optimized
 
-4. **Camera Calibration** ⭐ NEW
+4. **Camera Calibration**
    - OpenCV calibrateCamera with chessboard
    - Geometric distortion correction
    - YAML persistence (fx, fy, cx, cy, distortion coeffs)
    - 0.18px reprojection error
    - Real-time undistortion
 
-5. **Video Generation**
+5. **3D Iris Model** ⭐ NEW!
+   - Fit 3D concentric circles (pupil + iris) to RITnet masks
+   - Estimate 3D orientation: pitch (θ) and yaw (φ) angles
+   - Perspective projection with camera matrix
+   - Iris unwrapping to frontal view (256×64 polar coordinates)
+   - 0.97 IoU accuracy, ~2-3 seconds per frame
+   - Applications: gaze estimation, iris recognition, quality assessment
+
+6. **Video Generation**
    - Side-by-side original|detection output
    - 50/100 frame test videos
    - One-click open functionality
@@ -68,7 +77,8 @@ python pipeline_tuner_gui.py
 
 ## Documentation
 
-- **[CAMERA_CALIBRATION.md](CAMERA_CALIBRATION.md)** - Camera calibration and undistortion ⭐ NEW
+- **[IRIS_3D_MODEL.md](IRIS_3D_MODEL.md)** - 3D iris-pupil model and unwrapping ⭐ NEW!
+- **[CAMERA_CALIBRATION.md](CAMERA_CALIBRATION.md)** - Camera calibration and undistortion
 - **[RITNET_INTEGRATION.md](RITNET_INTEGRATION.md)** - RITnet eyelid detection setup and usage
 - **[EYELID_DETECTION_RESEARCH.md](EYELID_DETECTION_RESEARCH.md)** - Model comparison and research
 - **[VIDEO_GENERATION_GUIDE.md](VIDEO_GENERATION_GUIDE.md)** - Video testing feature
@@ -81,7 +91,7 @@ python pipeline_tuner_gui.py
 ```
 Eye1.mp4 (Near-IR, 400×400)
     ↓
-Step 0: Camera Undistortion (NEW!)
+Step 0: Camera Undistortion
     ↓
 Step 1: Frame Selection
     ↓
@@ -95,7 +105,12 @@ Step 5: Pupil Detection (Traditional CV)
     ↓
 Step 6: Eyelid Detection (RITnet AI)
     ↓
-Output: Pupil + Eyelid Data
+Step 7: 3D Iris Model (NEW!)
+    ├── Fit 3D concentric circles
+    ├── Estimate orientation (θ, φ)
+    └── Unwrap to frontal view
+    ↓
+Output: Pupil + Eyelid + 3D Orientation + Unwrapped Iris
 ```
 
 ## Technical Details
@@ -173,8 +188,9 @@ Validáció és QA
 ## Status
 
 ✅ **GUI**: Production ready  
-✅ **Camera Calibration**: Integrated (0.18px error) ⭐ NEW  
+✅ **Camera Calibration**: Integrated (0.18px error)  
 ✅ **RITnet**: Integrated and tested  
+✅ **3D Iris Model**: Integrated (0.97 IoU) ⭐ NEW!  
 ✅ **Video Generation**: Working  
 ⏳ **Full Video Processing**: In progress  
 ⏳ **mm Accuracy Conversion**: Planned  
@@ -182,4 +198,4 @@ Validáció és QA
 ---
 
 **Last Updated**: 2025-11-01  
-**Version**: 1.1 (Camera Calibration + RITnet Integration)
+**Version**: 1.2 (3D Iris Model + Camera Calibration + RITnet Integration)

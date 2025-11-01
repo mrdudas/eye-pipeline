@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Interactive Pipeline Tuner GUI
 Interaktív felület a pupilla detektálási pipeline beállításához
@@ -19,6 +20,7 @@ from tqdm import tqdm
 import torch
 from models import model_dict
 from camera_calibration import CameraCalibrator
+from iris_model_3d import IrisPupilModel3D
 
 
 class PipelineTunerGUI:
@@ -67,6 +69,15 @@ class PipelineTunerGUI:
         self.dist_coeffs = None
         self.calibration_loaded = False
         self.load_camera_calibration()
+        
+        # 3D Iris Model
+        self.iris_model_3d = IrisPupilModel3D(
+            self.width, self.height, 
+            camera_matrix=self.camera_matrix if self.calibration_loaded else None
+        )
+        self.current_iris_params = None
+        self.unwrapped_iris = None
+        self.ritnet_mask = None
         
         # GUI létrehozása
         self.create_gui()
@@ -258,6 +269,42 @@ class PipelineTunerGUI:
                        variable=self.show_vertical_axis,
                        command=self.update_preview).pack()
         
+        # === 7. 3D IRIS MODEL (NEW!) ===
+        section7 = ttk.LabelFrame(scrollable_frame, text="⭐ 7. 3D Iris Model (NEW!)", padding=10)
+        section7.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(section7, text="Fit 3D model to RITnet masks", 
+                 foreground="blue", font=("Arial", 9)).pack()
+        
+        self.iris_model_enabled = tk.BooleanVar(value=True)
+        ttk.Checkbutton(section7, text="Enable 3D Iris Model", 
+                       variable=self.iris_model_enabled,
+                       command=self.update_preview).pack()
+        
+        self.show_iris_overlay = tk.BooleanVar(value=True)
+        ttk.Checkbutton(section7, text="Show Model Overlay", 
+                       variable=self.show_iris_overlay,
+                       command=self.update_preview).pack()
+        
+        self.show_unwrapped = tk.BooleanVar(value=True)
+        ttk.Checkbutton(section7, text="Show Unwrapped Iris", 
+                       variable=self.show_unwrapped,
+                       command=self.update_preview).pack()
+        
+        # Model parameters display
+        self.iris_params_label = tk.StringVar(value="No model fitted yet")
+        ttk.Label(section7, textvariable=self.iris_params_label, 
+                 font=("Courier", 8), foreground="darkgreen").pack()
+        
+        self.optimization_method = tk.StringVar(value="de")
+        opt_frame = ttk.Frame(section7)
+        opt_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(opt_frame, text="Optimization:").pack(side=tk.LEFT)
+        ttk.Radiobutton(opt_frame, text="Fast (Nelder-Mead)", 
+                       variable=self.optimization_method, value="nelder-mead").pack(side=tk.LEFT)
+        ttk.Radiobutton(opt_frame, text="Accurate (DE)", 
+                       variable=self.optimization_method, value="de").pack(side=tk.LEFT)
+        
         # === ACTION BUTTONS ===
         action_frame = ttk.Frame(scrollable_frame)
         action_frame.pack(fill=tk.X, pady=20)
@@ -311,7 +358,7 @@ class PipelineTunerGUI:
     
     def create_image_displays(self, parent):
         """Képek megjelenítése"""
-        # Felső sor: Original és Preprocessing
+        # Felső sor: Original, Preprocessing, Result
         top_frame = ttk.Frame(parent)
         top_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
         
@@ -322,16 +369,22 @@ class PipelineTunerGUI:
         self.original_canvas.pack(fill=tk.BOTH, expand=True)
         
         # Preprocessing
-        right_frame = ttk.LabelFrame(top_frame, text="After Preprocessing")
-        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.preprocessed_canvas = tk.Canvas(right_frame, bg="black")
+        mid_frame = ttk.LabelFrame(top_frame, text="After Preprocessing")
+        mid_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        self.preprocessed_canvas = tk.Canvas(mid_frame, bg="black")
         self.preprocessed_canvas.pack(fill=tk.BOTH, expand=True)
         
-        # Alsó sor: Detection Result
-        bottom_frame = ttk.LabelFrame(parent, text="Pupil Detection Result")
-        bottom_frame.pack(fill=tk.BOTH, expand=True)
-        self.result_canvas = tk.Canvas(bottom_frame, bg="black")
+        # Result
+        right_frame = ttk.LabelFrame(top_frame, text="Detection Result")
+        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.result_canvas = tk.Canvas(right_frame, bg="black")
         self.result_canvas.pack(fill=tk.BOTH, expand=True)
+        
+        # Alsó sor: Unwrapped Iris (NEW!)
+        bottom_frame = ttk.LabelFrame(parent, text="⭐ Unwrapped Iris (Frontal View)")
+        bottom_frame.pack(fill=tk.BOTH, expand=True)
+        self.unwrapped_canvas = tk.Canvas(bottom_frame, bg="black")
+        self.unwrapped_canvas.pack(fill=tk.BOTH, expand=True)
     
     def on_frame_change(self, value):
         """Frame slider változás"""
@@ -526,10 +579,10 @@ class PipelineTunerGUI:
     def detect_eyelids_ritnet(self, frame, pupil_data=None):
         """
         Detect eyelids using RITnet semantic segmentation
-        Returns frame with annotations and eyelid data
+        Returns frame with annotations, eyelid data, and segmentation mask
         """
         if not self.eyelid_enabled.get() or not self.ritnet_available:
-            return frame, None
+            return frame, None, None
         
         annotated = frame.copy()
         original_size = frame.shape[:2]
@@ -613,13 +666,106 @@ class PipelineTunerGUI:
                     cv2.putText(annotated, f"Pupil Y pos: {relative_pos:.2f}", (10, 120),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             
-            return annotated, eyelid_data
+            # Store mask for 3D model fitting
+            self.ritnet_mask = mask
+            
+            return annotated, eyelid_data, mask
             
         except Exception as e:
             print(f"Error in RITnet detection: {e}")
             cv2.putText(annotated, f"RITnet Error: {str(e)[:30]}", (10, 90),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-            return annotated, None
+            return annotated, None, None
+    
+    def fit_3d_iris_model(self, frame, preprocessed, ritnet_mask):
+        """
+        Fit 3D iris-pupil model to RITnet segmentation mask
+        Returns frame with model overlay and unwrapped iris display
+        """
+        if not self.iris_model_enabled.get() or ritnet_mask is None:
+            self.current_iris_params = None
+            self.unwrapped_iris = None
+            self.iris_params_label.set("3D model disabled")
+            return frame
+        
+        annotated = frame.copy()
+        
+        try:
+            # Fit 3D model to mask
+            params = self.iris_model_3d.fit_to_mask(
+                ritnet_mask, 
+                method=self.optimization_method.get()
+            )
+            
+            self.current_iris_params = params
+            
+            # Update parameter display
+            param_text = (f"θ={params['theta_deg']:.1f}° φ={params['phi_deg']:.1f}° | "
+                         f"r_pupil={params['r_pupil']:.1f} r_iris={params['r_iris']:.1f} | "
+                         f"IoU: P={params['iou_pupil']:.2f} I={params['iou_iris']:.2f}")
+            self.iris_params_label.set(param_text)
+            
+            # Draw model overlay
+            if self.show_iris_overlay.get():
+                # Draw iris boundary (green)
+                iris_3d = self.iris_model_3d.generate_circle_points(
+                    params['r_iris'], num_points=100
+                )
+                iris_2d = self.iris_model_3d.project_to_image(
+                    iris_3d, params['theta'], params['phi'],
+                    params['cx'], params['cy'], params['distance']
+                )
+                iris_2d = iris_2d[~np.isnan(iris_2d).any(axis=1)]
+                if len(iris_2d) > 2:
+                    iris_contour = iris_2d.astype(np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(annotated, [iris_contour], True, (0, 255, 0), 2)
+                
+                # Draw pupil boundary (blue)
+                pupil_3d = self.iris_model_3d.generate_circle_points(
+                    params['r_pupil'], num_points=100
+                )
+                pupil_2d = self.iris_model_3d.project_to_image(
+                    pupil_3d, params['theta'], params['phi'],
+                    params['cx'], params['cy'], params['distance']
+                )
+                pupil_2d = pupil_2d[~np.isnan(pupil_2d).any(axis=1)]
+                if len(pupil_2d) > 2:
+                    pupil_contour = pupil_2d.astype(np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(annotated, [pupil_contour], True, (255, 0, 0), 2)
+                
+                # Draw center
+                cv2.circle(annotated, (int(params['cx']), int(params['cy'])), 
+                          5, (0, 255, 255), -1)
+                
+                # Draw rotation angles
+                cv2.putText(annotated, f"Pitch: {params['theta_deg']:.1f}deg", 
+                           (10, frame.shape[0] - 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                cv2.putText(annotated, f"Yaw: {params['phi_deg']:.1f}deg", 
+                           (10, frame.shape[0] - 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            
+            # Generate unwrapped iris
+            if self.show_unwrapped.get():
+                self.unwrapped_iris = self.iris_model_3d.unwrap_iris(
+                    preprocessed, params, output_size=(256, 64)
+                )
+            else:
+                self.unwrapped_iris = None
+            
+            return annotated
+            
+        except Exception as e:
+            print(f"Error in 3D iris model fitting: {e}")
+            import traceback
+            traceback.print_exc()
+            cv2.putText(annotated, f"3D Model Error: {str(e)[:40]}", 
+                       (10, frame.shape[0] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            self.current_iris_params = None
+            self.unwrapped_iris = None
+            self.iris_params_label.set(f"Error: {str(e)[:50]}")
+            return annotated
     
     def update_preview(self, *args):
         """Előnézet frissítése"""
@@ -635,13 +781,29 @@ class PipelineTunerGUI:
         # Pupil Detection
         result, pupil_data = self.detect_pupil_traditional(preprocessed)
         
-        # Eyelid Detection (RITnet)
-        result, eyelid_data = self.detect_eyelids_ritnet(result, pupil_data)
+        # Eyelid Detection (RITnet) - returns mask as well
+        result, eyelid_data, ritnet_mask = self.detect_eyelids_ritnet(result, pupil_data)
+        
+        # 3D Iris Model (NEW!)
+        result = self.fit_3d_iris_model(result, preprocessed, ritnet_mask)
         
         # Display
         self.display_image(self.original_frame, self.original_canvas)
         self.display_image(preprocessed, self.preprocessed_canvas)
         self.display_image(result, self.result_canvas)
+        
+        # Display unwrapped iris if available
+        if self.unwrapped_iris is not None and self.show_unwrapped.get():
+            self.display_image(self.unwrapped_iris, self.unwrapped_canvas)
+        else:
+            # Clear unwrapped canvas
+            self.unwrapped_canvas.delete("all")
+            self.unwrapped_canvas.create_text(
+                self.unwrapped_canvas.winfo_width()//2, 
+                self.unwrapped_canvas.winfo_height()//2,
+                text="Unwrapped iris disabled or not available",
+                fill="gray", font=("Arial", 12)
+            )
         
         self.status_var.set(f"Frame {self.current_frame_num}/{self.frame_count-1}")
     
