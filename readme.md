@@ -15,12 +15,13 @@ Accurate pupil detection and tracking pipeline for Near-IR eye tracking video (e
    - Settings save/load (YAML)
 
 2. **Pipeline Steps**
+   - **Step 0**: Camera Undistortion (geometric correction) ⭐ NEW
    - **Step 1**: Image Selection (frame slider)
    - **Step 2**: Glint Removal (threshold, area, morphology)
    - **Step 3**: Noise Reduction (bilateral/gaussian/median)
    - **Step 4**: CLAHE (contrast enhancement)
    - **Step 5**: Pupil Detection (traditional CV)
-   - **Step 6**: Eyelid Detection (RITnet AI) ⭐ NEW
+   - **Step 6**: Eyelid Detection (RITnet AI)
 
 3. **RITnet Integration**
    - Semantic segmentation (sclera, iris, pupil)
@@ -29,7 +30,14 @@ Accurate pupil detection and tracking pipeline for Near-IR eye tracking video (e
    - 95%+ accuracy, 100+ fps
    - Near-IR optimized
 
-4. **Video Generation**
+4. **Camera Calibration** ⭐ NEW
+   - OpenCV calibrateCamera with chessboard
+   - Geometric distortion correction
+   - YAML persistence (fx, fy, cx, cy, distortion coeffs)
+   - 0.18px reprojection error
+   - Real-time undistortion
+
+5. **Video Generation**
    - Side-by-side original|detection output
    - 50/100 frame test videos
    - One-click open functionality
@@ -60,16 +68,20 @@ python pipeline_tuner_gui.py
 
 ## Documentation
 
+- **[CAMERA_CALIBRATION.md](CAMERA_CALIBRATION.md)** - Camera calibration and undistortion ⭐ NEW
 - **[RITNET_INTEGRATION.md](RITNET_INTEGRATION.md)** - RITnet eyelid detection setup and usage
 - **[EYELID_DETECTION_RESEARCH.md](EYELID_DETECTION_RESEARCH.md)** - Model comparison and research
 - **[VIDEO_GENERATION_GUIDE.md](VIDEO_GENERATION_GUIDE.md)** - Video testing feature
 - **[GUI_USAGE_GUIDE.md](GUI_USAGE_GUIDE.md)** - GUI usage instructions
+- **[SETUP_GUIDE.md](SETUP_GUIDE.md)** - Installation and setup instructions
 - **[EYE_CORNERS_DETECTION.md](EYE_CORNERS_DETECTION.md)** - Eye corners (deprecated)
 
 ## Architecture
 
 ```
 Eye1.mp4 (Near-IR, 400×400)
+    ↓
+Step 0: Camera Undistortion (NEW!)
     ↓
 Step 1: Frame Selection
     ↓
@@ -124,10 +136,11 @@ Output: Pupil + Eyelid Data
 
 ### Advanced Features (TODO)
 
-Kamera kalibráció (mm pontossághoz kötelező)
-- IR-barát sakktábla/körrács képekkel OpenCV calibrateCamera.
-- Mentés YAML-be: fx, fy, cx, cy, distCoeffs.
-- Folyamatos feldolgozás előtt minden frame-et undistort-olj.
+Camera Calibration - ✅ DONE!
+- ✅ OpenCV calibrateCamera with 9×6 chessboard
+- ✅ YAML persistence (fx, fy, cx, cy, distCoeffs)
+- ✅ Real-time undistortion in pipeline
+- ✅ 0.18px reprojection error
 
 Pupil diameter mm-ben
 - Pixel átmérő = 2 × ellipszis kisebbik fél-tengely.
@@ -160,12 +173,13 @@ Validáció és QA
 ## Status
 
 ✅ **GUI**: Production ready  
+✅ **Camera Calibration**: Integrated (0.18px error) ⭐ NEW  
 ✅ **RITnet**: Integrated and tested  
 ✅ **Video Generation**: Working  
 ⏳ **Full Video Processing**: In progress  
-⏳ **Calibration**: Planned  
+⏳ **mm Accuracy Conversion**: Planned  
 
 ---
 
 **Last Updated**: 2025-11-01  
-**Version**: 1.0 (RITnet Integration)
+**Version**: 1.1 (Camera Calibration + RITnet Integration)
