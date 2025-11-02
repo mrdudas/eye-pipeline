@@ -40,7 +40,7 @@ class EllSegDetector:
     - Uses pre-trained DenseElNet (RITnet_v3) architecture
     """
     
-    def __init__(self, weights_path=None, device='cuda'):
+    def __init__(self, weights_path=None, device='cuda', use_fp16=False):
         """
         Initialize EllSeg detector
         
@@ -50,6 +50,8 @@ class EllSegDetector:
             Path to pre-trained weights file (.pt or .git_ok)
         device : str
             'cuda', 'mps', or 'cpu' (auto-detects if CUDA/MPS not available)
+        use_fp16 : bool
+            Use half precision (FP16) for faster inference (requires GPU)
         """
         # Auto-detect best available device
         if device == 'cuda' and not torch.cuda.is_available():
@@ -62,6 +64,7 @@ class EllSegDetector:
             device = 'cpu'
         
         self.device = torch.device(device)
+        self.use_fp16 = use_fp16 and device != 'cpu'  # FP16 only on GPU
         
         # Load model architecture (we'll implement simplified version)
         self.model = self._build_model()
@@ -126,7 +129,13 @@ class EllSegDetector:
                 
                 self.model.to(self.device)
                 self.model.eval()
-                print(f"✅ Loaded EllSeg weights from {weights_path}")
+                
+                # Convert to FP16 if requested
+                if self.use_fp16:
+                    self.model = self.model.half()
+                    print(f"✅ Loaded EllSeg weights from {weights_path} (FP16)")
+                else:
+                    print(f"✅ Loaded EllSeg weights from {weights_path}")
         except Exception as e:
             print(f"❌ Error loading weights: {e}")
             import traceback
@@ -184,6 +193,11 @@ class EllSegDetector:
         
         # Convert to tensor [1, 1, H, W]
         tensor = torch.from_numpy(frame_norm).unsqueeze(0).unsqueeze(0).float()
+        tensor = tensor.to(self.device)
+        
+        # Convert to FP16 if model is in FP16
+        if self.use_fp16:
+            tensor = tensor.half()
         
         # Store transformation info for inverse transform
         transform_info = {
