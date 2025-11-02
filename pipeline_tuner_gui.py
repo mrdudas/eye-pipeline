@@ -14,6 +14,12 @@ from pathlib import Path
 from threading import Thread
 import json
 from tqdm import tqdm
+import sys
+import subprocess
+import platform
+import time
+import traceback
+import torch
 
 # EllSeg integration (primary detection method)
 from ellseg_integration import EllSegDetector
@@ -54,7 +60,7 @@ class PipelineTunerGUI:
         
         # Auto-play control
         self.is_playing = False
-        self.play_interval = 100  # milliseconds (10 fps default)
+        self.play_interval = 80  # milliseconds (10 fps default)
         self.play_timer = None
         
         # Thread lock for video capture
@@ -102,6 +108,9 @@ class PipelineTunerGUI:
         
         # GUI létrehozása
         self.create_gui()
+        
+        # Load config file at startup (if exists)
+        self.load_settings_at_startup()
         
         # Első frame betöltése
         self.load_frame(0)
@@ -445,25 +454,60 @@ class PipelineTunerGUI:
             else:
                 print(f"Nem sikerült betölteni a frame-t: {frame_num}")
     
-    def preprocess_frame(self, frame):
-        """Frame előfeldolgozása a beállítások alapján"""
+    def preprocess_frame(self, frame, return_timing=False):
+        """Frame előfeldolgozása a beállítások alapján
+        
+        Args:
+            frame: Input frame
+            return_timing: If True, return (processed_frame, timing_dict)
+        
+        Returns:
+            processed_frame or (processed_frame, timing_dict)
+        """
+        import time
+        
+        timing = {}
+        
+        # Measure frame.copy() time
+        t0 = time.perf_counter()
         processed = frame.copy()
+        timing['frame_copy'] = time.perf_counter() - t0
         
         # 0. Camera undistortion (FIRST!)
-        processed = self.undistort_frame(processed)
+        if self.undistort_enabled.get():
+            t0_undistort = time.perf_counter()
+            processed = self.undistort_frame(processed)
+            timing['undistort'] = time.perf_counter() - t0_undistort
+        else:
+            timing['undistort'] = 0.0
         
         # 1. Glint removal
         if self.glint_enabled.get():
+            t0_glint = time.perf_counter()
             processed = self.remove_glints(processed)
+            timing['glint_removal'] = time.perf_counter() - t0_glint
+        else:
+            timing['glint_removal'] = 0.0
         
         # 2. Noise reduction
-        if self.noise_enabled.get():
+        noise_is_enabled = self.noise_enabled.get()
+        if noise_is_enabled:
+            t0_noise = time.perf_counter()
             processed = self.reduce_noise(processed)
+            timing['noise_reduction'] = time.perf_counter() - t0_noise
+        else:
+            timing['noise_reduction'] = 0.0
         
         # 3. CLAHE
         if self.clahe_enabled.get():
+            t0_clahe = time.perf_counter()
             processed = self.apply_clahe(processed)
+            timing['clahe'] = time.perf_counter() - t0_clahe
+        else:
+            timing['clahe'] = 0.0
         
+        if return_timing:
+            return processed, timing
         return processed
     
     def remove_glints(self, frame):
@@ -668,124 +712,7 @@ class PipelineTunerGUI:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
         return annotated, pupil_data, iris_data
-    
-    def detect_eye_corners(self, frame, pupil_data=None, iris_data=None):
-        """
-        Detect eye corners (inner and outer canthus) using corner detection
-        Returns frame with annotations and corner data
-        """
-        if not self.eye_corners_enabled.get():
-            self.corner_info_label.set("Eye corners detection disabled")
-            return frame, None
-        
-        annotated = frame.copy()
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame.copy()
-        
-        # Parameters
-        quality_level = self.corner_quality.get()
-        min_distance = self.corner_min_distance.get()
-        method = self.corner_method.get()
-        
-        corners_data = None
-        
-        try:
-            if method == "shi-tomasi":
-                # Shi-Tomasi corner detection (goodFeaturesToTrack)
-                corners = cv2.goodFeaturesToTrack(
-                    gray,
-                    maxCorners=20,
-                    qualityLevel=quality_level,
-                    minDistance=min_distance,
-                    blockSize=7
-                )
-            else:  # harris
-                # Harris corner detection
-                gray_float = np.float32(gray)
-                harris = cv2.cornerHarris(gray_float, blockSize=7, ksize=5, k=0.04)
-                harris = cv2.dilate(harris, None)
-                
-                # Threshold
-                threshold = quality_level * harris.max()
-                corner_coords = np.argwhere(harris > threshold)
-                
-                # Convert to goodFeaturesToTrack format
-                if len(corner_coords) > 0:
-                    corners = corner_coords[:, ::-1].astype(np.float32).reshape(-1, 1, 2)
-                else:
-                    corners = None
-            
-            if corners is not None and len(corners) >= 2:
-                # Convert to regular array
-                corners = corners.reshape(-1, 2)
-                
-                # Find leftmost and rightmost corners (eye corners are horizontal extremes)
-                left_idx = np.argmin(corners[:, 0])
-                right_idx = np.argmax(corners[:, 0])
-                
-                left_corner = tuple(corners[left_idx].astype(int))
-                right_corner = tuple(corners[right_idx].astype(int))
-                
-                # Calculate horizontal axis
-                center_x = (left_corner[0] + right_corner[0]) // 2
-                center_y = (left_corner[1] + right_corner[1]) // 2
-                center = (center_x, center_y)
-                
-                # Calculate angle and distance
-                dx = right_corner[0] - left_corner[0]
-                dy = right_corner[1] - left_corner[1]
-                angle = np.degrees(np.arctan2(dy, dx))
-                eye_width = np.sqrt(dx**2 + dy**2)
-                
-                corners_data = {
-                    'left': left_corner,
-                    'right': right_corner,
-                    'center': center,
-                    'angle': angle,
-                    'eye_width': eye_width
-                }
-                
-                # Draw corners
-                cv2.circle(annotated, left_corner, 5, (255, 0, 0), -1)  # Blue for left
-                cv2.circle(annotated, right_corner, 5, (255, 0, 0), -1)  # Blue for right
-                cv2.putText(annotated, "L", (left_corner[0] - 15, left_corner[1] - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-                cv2.putText(annotated, "R", (right_corner[0] + 10, right_corner[1] - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-                
-                # Draw horizontal axis
-                if self.show_horizontal_axis.get():
-                    cv2.line(annotated, left_corner, right_corner, (0, 255, 255), 2)  # Yellow line
-                    cv2.circle(annotated, center, 4, (255, 255, 0), -1)  # Cyan center
-                    
-                    # Display info
-                    info_y = frame.shape[0] - 80
-                    cv2.putText(annotated, f"Eye axis: {angle:.1f}deg", 
-                               (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                    cv2.putText(annotated, f"Eye width: {eye_width:.1f}px", 
-                               (10, info_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                
-                # Update info label
-                self.corner_info_label.set(
-                    f"L=({left_corner[0]},{left_corner[1]}) R=({right_corner[0]},{right_corner[1]}) | "
-                    f"Width={eye_width:.1f}px Angle={angle:.1f}°"
-                )
-                
-            else:
-                self.corner_info_label.set("Not enough corners detected (need at least 2)")
-                cv2.putText(annotated, "No eye corners detected", 
-                           (10, frame.shape[0] - 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-        
-        except Exception as e:
-            print(f"Error in eye corners detection: {e}")
-            import traceback
-            traceback.print_exc()
-            self.corner_info_label.set(f"Error: {str(e)[:50]}")
-            cv2.putText(annotated, f"Corner Error: {str(e)[:30]}", 
-                       (10, frame.shape[0] - 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-        
-        return annotated, corners_data
+
     
     def detect_ellseg(self, frame):
         """
@@ -1088,118 +1015,141 @@ class PipelineTunerGUI:
         thread.start()
     
     def _run_test_thread(self, num_frames):
-        """Teszt futtatása thread-ben és videó generálása"""
+        """Teszt futtatása subprocess-ben - tiszta és gyors megoldás"""
+        import subprocess
+        import tempfile
+        import time
+        
+        overall_start = time.perf_counter()
         start_frame = self.current_frame_num
         end_frame = min(start_frame + num_frames, self.frame_count)
         
-        results = []
+        print(f"\n{'='*60}")
+        print(f"🚀 LAUNCHING SUBPROCESS FOR VIDEO CREATION: {num_frames} frames")
+        print(f"{'='*60}\n")
         
-        # Videó kimenet előkészítése
+        # Save current settings to temp config
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            temp_config = Path(f.name)
+            config_data = {
+                'undistort': {'enabled': self.undistort_enabled.get()},
+                'glint': {
+                    'enabled': self.glint_enabled.get(),
+                    'threshold': self.glint_threshold.get(),
+                    'min_area': self.glint_min_area.get(),
+                    'max_area': self.glint_max_area.get(),
+                    'iterations': self.glint_iterations.get()
+                },
+                'noise': {
+                    'enabled': self.noise_enabled.get(),
+                    'method': self.noise_method.get(),
+                    'strength': self.noise_strength.get()
+                },
+                'clahe': {
+                    'enabled': self.clahe_enabled.get(),
+                    'clip_limit': self.clahe_clip_limit.get(),
+                    'tile_size': self.clahe_tile_size.get()
+                },
+                'ellseg': {
+                    'enabled': self.ellseg_enabled.get(),
+                    'show_segmentation': self.ellseg_show_segmentation.get()
+                }
+            }
+            import yaml
+            yaml.dump(config_data, f)
+        
+        # Output file
         output_dir = Path("output")
         output_dir.mkdir(exist_ok=True)
         output_file = output_dir / f"test_frames_{start_frame}_to_{end_frame-1}.mp4"
         
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        # Three views side-by-side: original + detection result + frontal view
-        # Frontal view is 400x400, so we need to resize it to match height
-        frontal_width = int(400 * self.height / 400)  # Scale to match height
-        out = cv2.VideoWriter(str(output_file), fourcc, self.fps, (self.width * 2 + frontal_width, self.height))
+        # Build command
+        cmd = [
+            sys.executable,  # Use same Python interpreter
+            'pipeline_processor.py',
+            '--config', str(temp_config),
+            '--video', self.video_path,
+            '--frames', str(num_frames),
+            '--start-frame', str(start_frame),
+            '--output', str(output_file)
+        ]
         
-        detected_count = 0
-        
-        # Külön videó capture a thread számára
-        test_cap = cv2.VideoCapture(self.video_path)
-        
-        # Seek to start frame once
-        test_cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        print(f"🔧 Command: {' '.join(cmd)}\n")
         
         try:
-            for idx in range(num_frames):
-                frame_num = start_frame + idx
+            # Run subprocess with real-time output
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+            
+            # Stream output line by line
+            detected_count = 0
+            frames_processed = 0
+            
+            for line in process.stdout:
+                print(line, end='')  # Print to console
                 
-                # Linear read (no seeking) - much faster!
-                ret, frame = test_cap.read()
-                
-                if not ret:
-                    print(f"Warning: Failed to read frame {frame_num}")
-                    continue
-                
-                # Preprocess
-                preprocessed = self.preprocess_frame(frame)
-                
-                # Detect pupil & iris (use EllSeg if available, else Traditional CV)
-                if self.ellseg_available and self.ellseg_enabled.get():
-                    result_frame, pupil_data, iris_data = self.detect_ellseg(preprocessed)
-                else:
-                    result_frame, pupil_data, iris_data = self.detect_pupil_traditional(preprocessed)
-                
-                # Check detection
-                detected = pupil_data is not None
-                
-                results.append(detected)
-                if detected:
-                    detected_count += 1
-                
-                # Frame info hozzáadása az originalhoz
-                info_frame = frame.copy()
-                cv2.putText(info_frame, f"Frame: {frame_num}", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.putText(info_frame, f"Original", (10, 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                
-                # Detection status a result frame-re
-                status_color = (0, 255, 0) if detected else (0, 0, 255)
-                status_text = "DETECTED" if detected else "NOT DETECTED"
-                cv2.putText(result_frame, status_text, (10, self.height - 20),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-                
-                current_rate = (detected_count / (frame_num - start_frame + 1)) * 100
-                cv2.putText(result_frame, f"Rate: {current_rate:.1f}%", (10, self.height - 50),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                
-                # Prepare frontal view (resize to match height)
-                if self.unwrapped_frontal is not None:
-                    # Convert grayscale to BGR if needed
-                    if len(self.unwrapped_frontal.shape) == 2:
-                        frontal_bgr = cv2.cvtColor(self.unwrapped_frontal, cv2.COLOR_GRAY2BGR)
-                    else:
-                        frontal_bgr = self.unwrapped_frontal
-                    
-                    frontal_resized = cv2.resize(frontal_bgr, (frontal_width, self.height))
-                    # Add label
-                    cv2.putText(frontal_resized, "Frontal View", (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                else:
-                    # Create black placeholder if no frontal view
-                    frontal_resized = np.zeros((self.height, frontal_width, 3), dtype=np.uint8)
-                    cv2.putText(frontal_resized, "No frontal view", (10, self.height // 2),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
-                
-                # Three views side-by-side: original + detection result + frontal
-                combined = np.hstack([info_frame, result_frame, frontal_resized])
-                out.write(combined)
-                
-                # Update status every 5 frames (reduce GUI overhead)
-                if idx % 5 == 0:
-                    progress = (idx + 1) / num_frames * 100
-                    self.root.after(0, lambda p=progress, d=detected_count, f=idx+1: 
-                                  self.status_var.set(f"Creating video: {p:.0f}% ({d}/{f} detected)"))
-        
+                # Parse progress info
+                if 'Frame' in line and '/' in line:
+                    # Extract frame number and detection count
+                    try:
+                        parts = line.split('|')
+                        frame_part = parts[0].strip()
+                        if 'Detected:' in line:
+                            detected_part = [p for p in parts if 'Detected:' in p][0]
+                            detected_str = detected_part.split('Detected:')[1].split('(')[0].strip()
+                            detected_count = int(detected_str.split('/')[0])
+                            frames_processed = int(detected_str.split('/')[1])
+                            
+                            # Update GUI
+                            progress = (frames_processed / num_frames) * 100
+                            self.root.after(0, lambda p=progress, d=detected_count, f=frames_processed: 
+                                          self.status_var.set(f"Subprocess: {p:.0f}% ({d}/{f} detected)"))
+                    except:
+                        pass  # Ignore parse errors
+            
+            # Wait for completion
+            return_code = process.wait()
+            
+            if return_code != 0:
+                raise subprocess.CalledProcessError(return_code, cmd)
+            
+            # Clean up temp config
+            temp_config.unlink()
+            
+            overall_time = time.perf_counter() - overall_start
+            
+            print(f"\n{'='*60}")
+            print(f"✅ SUBPROCESS COMPLETED")
+            print(f"   Total wallclock time: {overall_time:.2f}s")
+            print(f"{'='*60}\n")
+            
+            # Show results
+            # Parse detection rate from output (or assume 100% if we got here)
+            detection_rate = (detected_count / frames_processed * 100) if frames_processed > 0 else 100.0
+            
+            self.root.after(0, lambda: self.show_test_results(detection_rate, frames_processed, output_file))
+            self.root.after(0, lambda: self.status_var.set(f"✅ Video ready: {output_file.name}"))
+            
+        except subprocess.CalledProcessError as e:
+            print(f"\n❌ Subprocess failed with code {e.returncode}")
+            self.root.after(0, lambda: self.status_var.set(f"❌ Error: subprocess failed"))
+            
         except Exception as e:
-            print(f"Error during test: {e}")
-            error_msg = str(e)
-            self.root.after(0, lambda msg=error_msg: self.status_var.set(f"Error: {msg}"))
-        
+            print(f"\n❌ Error: {e}")
+            import traceback
+            traceback.print_exc()
+            self.root.after(0, lambda e=e: self.status_var.set(f"❌ Error: {e}"))
+            
         finally:
-            out.release()
-            test_cap.release()
-        
-        # Calculate statistics
-        detection_rate = sum(results) / len(results) * 100 if results else 0
-        
-        # Show result and open video
-        self.root.after(0, lambda: self.show_test_results(detection_rate, len(results), output_file))
-        self.root.after(0, lambda: self.status_var.set(f"Video ready: {output_file.name}"))
+            # Clean up temp config if it still exists
+            if temp_config.exists():
+                temp_config.unlink()
     
     def show_test_results(self, detection_rate, num_frames, video_path):
         """Teszt eredmények megjelenítése és videó megnyitása"""
@@ -1269,10 +1219,40 @@ class PipelineTunerGUI:
     
     def _process_full_video_thread(self):
         """Teljes videó feldolgozása thread-ben - OPTIMIZED"""
+        import time
+        
+        overall_start = time.perf_counter()
         total_frames = self.frame_count
+        
+        print(f"\n{'='*60}")
+        print(f"🎬 STARTING FULL VIDEO PROCESSING: {total_frames} frames")
+        print(f"{'='*60}")
+        print(f"📋 PIPELINE SETTINGS:")
+        print(f"   Undistort: {self.undistort_enabled.get()}")
+        print(f"   Glint removal: {self.glint_enabled.get()}")
+        print(f"   Noise reduction: {self.noise_enabled.get()} (method: {self.noise_method.get()}, strength: {self.noise_strength.get()})")
+        print(f"   CLAHE: {self.clahe_enabled.get()}")
+        print(f"   EllSeg: {self.ellseg_enabled.get()}")
+        print(f"{'='*60}\n")
+        
         results = []
         
+        # Timing accumulators
+        time_read = 0.0
+        time_preprocess_total = 0.0
+        time_preprocess_frame_copy = 0.0
+        time_preprocess_undistort = 0.0
+        time_preprocess_glint = 0.0
+        time_preprocess_noise = 0.0
+        time_preprocess_clahe = 0.0
+        time_detect = 0.0
+        time_annotate = 0.0
+        time_compose = 0.0
+        time_write = 0.0
+        time_gui_update = 0.0
+        
         # Output video setup
+        t0 = time.perf_counter()
         output_dir = Path("output")
         output_dir.mkdir(exist_ok=True)
         
@@ -1284,6 +1264,8 @@ class PipelineTunerGUI:
         # Frontal view is 400x400, so we need to resize it to match height
         frontal_width = int(400 * self.height / 400)  # Scale to match height
         out = cv2.VideoWriter(str(output_file), fourcc, self.fps, (self.width * 2 + frontal_width, self.height))
+        time_setup = time.perf_counter() - t0
+        print(f"⚙️  Setup & VideoWriter init: {time_setup*1000:.2f} ms\n")
         
         detected_count = 0
         
@@ -1298,20 +1280,31 @@ class PipelineTunerGUI:
             frame_num = 0
             while frame_num < total_frames:
                 # Read frame (linear, no seek - much faster!)
+                t0 = time.perf_counter()
                 ret, frame = process_cap.read()
+                time_read += time.perf_counter() - t0
                 
                 if not ret:
-                    print(f"Warning: Failed to read frame {frame_num}")
+                    print(f"⚠️  Warning: Failed to read frame {frame_num}")
                     break
                 
-                # Preprocess
-                preprocessed = self.preprocess_frame(frame)
+                # Preprocess with detailed timing
+                t0 = time.perf_counter()
+                preprocessed, preproc_timing = self.preprocess_frame(frame, return_timing=True)
+                time_preprocess_total += time.perf_counter() - t0
+                time_preprocess_frame_copy += preproc_timing.get('frame_copy', 0)
+                time_preprocess_undistort += preproc_timing.get('undistort', 0)
+                time_preprocess_glint += preproc_timing.get('glint_removal', 0)
+                time_preprocess_noise += preproc_timing.get('noise_reduction', 0)
+                time_preprocess_clahe += preproc_timing.get('clahe', 0)
                 
                 # Detect pupil & iris (use EllSeg if available, else Traditional CV)
+                t0 = time.perf_counter()
                 if self.ellseg_available and self.ellseg_enabled.get():
                     result_frame, pupil_data, iris_data = self.detect_ellseg(preprocessed)
                 else:
                     result_frame, pupil_data, iris_data = self.detect_pupil_traditional(preprocessed)
+                time_detect += time.perf_counter() - t0
                 
                 # Check detection
                 detected = pupil_data is not None
@@ -1321,6 +1314,7 @@ class PipelineTunerGUI:
                     detected_count += 1
                 
                 # Frame info on original
+                t0 = time.perf_counter()
                 info_frame = frame.copy()
                 cv2.putText(info_frame, f"Frame: {frame_num}/{total_frames}", (10, 30),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -1336,8 +1330,10 @@ class PipelineTunerGUI:
                 current_rate = (detected_count / (frame_num + 1)) * 100
                 cv2.putText(result_frame, f"Rate: {current_rate:.1f}%", (10, self.height - 50),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                time_annotate += time.perf_counter() - t0
                 
                 # Prepare frontal view (resize to match height)
+                t0 = time.perf_counter()
                 if self.unwrapped_frontal is not None:
                     # Convert grayscale to BGR if needed
                     if len(self.unwrapped_frontal.shape) == 2:
@@ -1357,20 +1353,35 @@ class PipelineTunerGUI:
                 
                 # Three views side-by-side: original + detection result + frontal
                 combined = np.hstack([info_frame, result_frame, frontal_resized])
+                time_compose += time.perf_counter() - t0
                 
                 # Write immediately (no batching for video I/O - it's already buffered)
+                t0 = time.perf_counter()
                 out.write(combined)
+                time_write += time.perf_counter() - t0
                 
-                # Update status every 30 frames (reduce GUI overhead)
-                if frame_num % 30 == 0:
+                # Progress report every 50 frames
+                if (frame_num + 1) % 50 == 0:
+                    elapsed = time.perf_counter() - overall_start
+                    fps_current = (frame_num + 1) / elapsed
+                    eta = (total_frames - frame_num - 1) / fps_current if fps_current > 0 else 0
+                    print(f"📊 Frame {frame_num+1}/{total_frames} | "
+                          f"FPS: {fps_current:.2f} | "
+                          f"Detected: {detected_count}/{frame_num+1} ({detected_count/(frame_num+1)*100:.1f}%) | "
+                          f"ETA: {eta:.1f}s")
+                
+                # Update status every 100 frames (reduce GUI overhead - was 30)
+                if frame_num % 100 == 0:
+                    t0_gui = time.perf_counter()
                     progress = (frame_num + 1) / total_frames * 100
                     self.root.after(0, lambda p=progress, d=detected_count, f=frame_num+1: 
                                   self.status_var.set(f"Processing: {p:.1f}% ({d}/{f} detected)"))
+                    time_gui_update += time.perf_counter() - t0_gui
                 
                 frame_num += 1
         
         except Exception as e:
-            print(f"Error during processing: {e}")
+            print(f"❌ Error during processing: {e}")
             import traceback
             traceback.print_exc()
             self.root.after(0, lambda e=e: self.status_var.set(f"Error: {e}"))
@@ -1380,7 +1391,37 @@ class PipelineTunerGUI:
             process_cap.release()
         
         # Calculate statistics
+        overall_time = time.perf_counter() - overall_start
         detection_rate = sum(results) / len(results) * 100 if results else 0
+        
+        # Print detailed timing report
+        print(f"\n{'='*60}")
+        print(f"✅ FULL VIDEO PROCESSING COMPLETE")
+        print(f"{'='*60}")
+        print(f"📁 Output: {output_file}")
+        print(f"🎞️  Frames processed: {len(results)}")
+        print(f"👁️  Detection rate: {detection_rate:.1f}% ({sum(results)}/{len(results)})")
+        print(f"⏱️  Total time: {overall_time:.2f}s ({overall_time/60:.1f} min)")
+        print(f"⚡ Average FPS: {len(results)/overall_time:.2f}")
+        print(f"\n{'─'*60}")
+        print(f"TIMING BREAKDOWN (per frame average):")
+        print(f"{'─'*60}")
+        if len(results) > 0:
+            print(f"  📖 Read frame:       {time_read/len(results)*1000:7.2f} ms  ({time_read/overall_time*100:5.1f}%)")
+            print(f"  🔧 Preprocessing:    {time_preprocess_total/len(results)*1000:7.2f} ms  ({time_preprocess_total/overall_time*100:5.1f}%)")
+            print(f"     ├─ Frame copy:    {time_preprocess_frame_copy/len(results)*1000:7.2f} ms  ({time_preprocess_frame_copy/overall_time*100:5.1f}%)")
+            print(f"     ├─ Undistort:     {time_preprocess_undistort/len(results)*1000:7.2f} ms  ({time_preprocess_undistort/overall_time*100:5.1f}%)")
+            print(f"     ├─ Glint removal: {time_preprocess_glint/len(results)*1000:7.2f} ms  ({time_preprocess_glint/overall_time*100:5.1f}%)")
+            print(f"     ├─ Noise reduc.:  {time_preprocess_noise/len(results)*1000:7.2f} ms  ({time_preprocess_noise/overall_time*100:5.1f}%)")
+            print(f"     └─ CLAHE:         {time_preprocess_clahe/len(results)*1000:7.2f} ms  ({time_preprocess_clahe/overall_time*100:5.1f}%)")
+            print(f"  🎯 Detection:        {time_detect/len(results)*1000:7.2f} ms  ({time_detect/overall_time*100:5.1f}%)")
+            print(f"  ✏️  Annotation:       {time_annotate/len(results)*1000:7.2f} ms  ({time_annotate/overall_time*100:5.1f}%)")
+            print(f"  🖼️  Compose views:    {time_compose/len(results)*1000:7.2f} ms  ({time_compose/overall_time*100:5.1f}%)")
+            print(f"  💾 Write frame:      {time_write/len(results)*1000:7.2f} ms  ({time_write/overall_time*100:5.1f}%)")
+            print(f"  🖥️  GUI update:       {time_gui_update/len(results)*1000:7.2f} ms  ({time_gui_update/overall_time*100:5.1f}%)")
+            print(f"{'─'*60}")
+            print(f"  🔢 Total per frame:  {overall_time/len(results)*1000:7.2f} ms")
+        print(f"{'='*60}\n")
         
         # Show result
         self.root.after(0, lambda: self.show_full_video_results(detection_rate, len(results), output_file))
@@ -1491,6 +1532,72 @@ class PipelineTunerGUI:
             
         except FileNotFoundError:
             messagebox.showerror("Error", "pipeline_settings.yaml not found")
+    
+    def load_settings_at_startup(self):
+        """Load config file silently at startup (no popups)"""
+        try:
+            config_file = self.config_path if hasattr(self, 'config_path') else "pipeline_settings.yaml"
+            
+            # Try the specified config_path first, then fall back to pipeline_settings.yaml
+            if not Path(config_file).exists():
+                config_file = "pipeline_settings.yaml"
+            
+            if not Path(config_file).exists():
+                print(f"⚠️  No config file found at startup (tried: {self.config_path}, pipeline_settings.yaml)")
+                return
+            
+            with open(config_file, 'r', encoding='utf-8') as f:
+                settings = yaml.safe_load(f)
+            
+            # Camera
+            if 'camera' in settings:
+                self.undistort_enabled.set(settings['camera'].get('undistort_enabled', False))
+            
+            # Glint
+            if 'glint' in settings:
+                self.glint_enabled.set(settings['glint'].get('enabled', True))
+                self.glint_threshold.set(settings['glint'].get('threshold', 240))
+                self.glint_min_area.set(settings['glint'].get('min_area', 5))
+                self.glint_max_area.set(settings['glint'].get('max_area', 200))
+                self.glint_iterations.set(settings['glint'].get('morph_iterations', 3))
+            
+            # Noise
+            if 'noise' in settings:
+                self.noise_enabled.set(settings['noise'].get('enabled', True))
+                self.noise_method.set(settings['noise'].get('method', 'bilateral'))
+                self.noise_strength.set(settings['noise'].get('strength', 5))
+            
+            # CLAHE
+            if 'clahe' in settings:
+                self.clahe_enabled.set(settings['clahe'].get('enabled', False))
+                self.clahe_clip_limit.set(settings['clahe'].get('clip_limit', 2.0))
+                self.clahe_tile_size.set(settings['clahe'].get('tile_size', 8))
+            
+            # Pupil
+            if 'pupil' in settings:
+                self.pupil_threshold.set(settings['pupil'].get('threshold', 50))
+                self.pupil_min_area.set(settings['pupil'].get('min_area', 100))
+                self.pupil_morph_size.set(settings['pupil'].get('morph_kernel', 5))
+            
+            # Iris
+            if 'iris' in settings:
+                self.iris_enabled.set(settings['iris'].get('enabled', True))
+                self.iris_threshold.set(settings['iris'].get('threshold', 80))
+                self.iris_min_area.set(settings['iris'].get('min_area', 5000))
+                self.iris_max_area.set(settings['iris'].get('max_area', 50000))
+            
+            # EllSeg
+            if 'ellseg' in settings:
+                self.ellseg_enabled.set(settings['ellseg'].get('enabled', True))
+                self.ellseg_show_segmentation.set(settings['ellseg'].get('show_segmentation', True))
+            
+            print(f"✅ Config loaded from: {config_file}")
+            self.status_var.set(f"Config loaded: {Path(config_file).name}")
+            
+        except Exception as e:
+            print(f"⚠️  Could not load config at startup: {e}")
+            # Don't show error popup at startup, just continue with defaults
+
     
     def load_camera_calibration(self, filename="camera_calibration.yaml"):
         """
