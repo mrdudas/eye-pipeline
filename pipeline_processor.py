@@ -29,6 +29,7 @@ import torch
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 import sys
+import csv
 
 # Import our detection modules
 from ellseg_integration import EllSegDetector
@@ -312,7 +313,7 @@ class PipelineProcessor:
         
         return result
     
-    def detect_ellseg(self, frame: np.ndarray) -> Tuple[np.ndarray, Optional[Dict], Optional[Dict]]:
+    def detect_ellseg(self, frame: np.ndarray) -> Tuple[np.ndarray, Optional[Dict], Optional[Dict], np.ndarray]:
         """
         Detect pupil and iris using EllSeg
         
@@ -320,16 +321,18 @@ class PipelineProcessor:
             frame: Preprocessed BGR frame
             
         Returns:
-            (annotated_frame, pupil_data, iris_data)
+            (annotated_frame, pupil_data, iris_data, gray_frame)
         """
         if not self.config.get('ellseg', {}).get('enabled', True):
-            return frame, None, None
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame.copy()
+            return frame, None, None, gray
         
         if not self.ellseg_available:
-            return frame, None, None
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame.copy()
+            return frame, None, None, gray
         
         annotated = frame.copy()
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame.copy()
         
         try:
             results = self.ellseg_detector.detect(gray)
@@ -394,11 +397,11 @@ class PipelineProcessor:
                     'ellipse': iris_ellipse  # Store raw ellipse for iris unwrapping
                 }
             
-            return annotated, pupil_data, iris_data
+            return annotated, pupil_data, iris_data, gray
             
         except Exception as e:
             print(f"⚠️  EllSeg detection failed: {e}")
-            return frame, None, None
+            return frame, None, None, gray
     
     def process_frames(self, start_frame: int, num_frames: int, output_path: Path):
         """
@@ -435,6 +438,23 @@ class PipelineProcessor:
         combined_width = self.width * 2 + frontal_width
         out = cv2.VideoWriter(str(output_path), fourcc, self.fps, (combined_width, self.height))
         
+        # Create CSV file path (same name as video, but .csv extension)
+        csv_path = output_path.with_suffix('.csv')
+        csv_file = open(csv_path, 'w', newline='', encoding='utf-8')
+        csv_writer = csv.writer(csv_file)
+        
+        # Write CSV header
+        csv_writer.writerow([
+            'frame_id',
+            'pupil_x', 'pupil_y', 'pupil_diameter_px',
+            'iris_x', 'iris_y',
+            'pupil_ellipse_cx', 'pupil_ellipse_cy', 'pupil_ellipse_a', 'pupil_ellipse_b', 'pupil_ellipse_angle',
+            'iris_ellipse_cx', 'iris_ellipse_cy', 'iris_ellipse_a', 'iris_ellipse_b', 'iris_ellipse_angle',
+            'detected'
+        ])
+        
+        print(f"📊 CSV output: {csv_path}")
+        
         # Seek to start frame
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         
@@ -464,29 +484,79 @@ class PipelineProcessor:
                 
                 # Detect
                 t0 = time.perf_counter()
-                result_frame, pupil_data, iris_data = self.detect_ellseg(preprocessed)
+                result_frame, pupil_data, iris_data, gray = self.detect_ellseg(preprocessed)
                 timing_stats['detect'] += time.perf_counter() - t0
+                
+                # Initialize CSV row data
+                csv_row = {
+                    'frame_id': frame_num,
+                    'pupil_x': '', 'pupil_y': '', 'pupil_diameter_px': '',
+                    'iris_x': '', 'iris_y': '',
+                    'pupil_ellipse_cx': '', 'pupil_ellipse_cy': '', 
+                    'pupil_ellipse_a': '', 'pupil_ellipse_b': '', 'pupil_ellipse_angle': '',
+                    'iris_ellipse_cx': '', 'iris_ellipse_cy': '', 
+                    'iris_ellipse_a': '', 'iris_ellipse_b': '', 'iris_ellipse_angle': '',
+                    'detected': 0
+                }
                 
                 if pupil_data is not None:
                     detected_count += 1
+                    csv_row['detected'] = 1
+                    
+                    # Store pupil center
+                    if 'center' in pupil_data:
+                        csv_row['pupil_x'] = f"{pupil_data['center'][0]:.2f}"
+                        csv_row['pupil_y'] = f"{pupil_data['center'][1]:.2f}"
+                    
+                    # Store pupil ellipse
+                    if 'ellipse' in pupil_data:
+                        ellipse = pupil_data['ellipse']  # [cx, cy, a, b, angle]
+                        csv_row['pupil_ellipse_cx'] = f"{ellipse[0]:.2f}"
+                        csv_row['pupil_ellipse_cy'] = f"{ellipse[1]:.2f}"
+                        csv_row['pupil_ellipse_a'] = f"{ellipse[2]:.2f}"
+                        csv_row['pupil_ellipse_b'] = f"{ellipse[3]:.2f}"
+                        csv_row['pupil_ellipse_angle'] = f"{ellipse[4]:.4f}"
+                
+                # Store iris data
+                if iris_data is not None:
+                    if 'center' in iris_data:
+                        csv_row['iris_x'] = f"{iris_data['center'][0]:.2f}"
+                        csv_row['iris_y'] = f"{iris_data['center'][1]:.2f}"
+                    
+                    if 'ellipse' in iris_data:
+                        ellipse = iris_data['ellipse']  # [cx, cy, a, b, angle]
+                        csv_row['iris_ellipse_cx'] = f"{ellipse[0]:.2f}"
+                        csv_row['iris_ellipse_cy'] = f"{ellipse[1]:.2f}"
+                        csv_row['iris_ellipse_a'] = f"{ellipse[2]:.2f}"
+                        csv_row['iris_ellipse_b'] = f"{ellipse[3]:.2f}"
+                        csv_row['iris_ellipse_angle'] = f"{ellipse[4]:.4f}"
                 
                 # Generate frontal view if iris detected
                 unwrapped_frontal = None
                 pupil_measurements = None
+                iris_ellipse_frontal = None
+                pupil_ellipse_frontal = None
                 if iris_data is not None and 'ellipse' in iris_data:
                     try:
                         # Get iris and pupil ellipses (already in EllSeg format: [cx, cy, a, b, angle_rad])
                         iris_ellipse = iris_data['ellipse']
                         pupil_ellipse = pupil_data['ellipse'] if pupil_data and 'ellipse' in pupil_data else iris_ellipse
                         
-                        # Process iris (convert to grayscale if needed)
-                        gray = cv2.cvtColor(preprocessed, cv2.COLOR_BGR2GRAY) if len(preprocessed.shape) == 3 else preprocessed
+                        # Use the same gray image that was used for detection (matches GUI behavior)
                         results = self.iris_unwrapper.process_iris(gray, iris_ellipse, pupil_ellipse)
                         unwrapped_frontal = results['frontal_view']
+                        
+                        # Extract transformed ellipses for drawing on frontal view
+                        iris_ellipse_frontal = results.get('iris_ellipse_frontal')
+                        pupil_ellipse_frontal = results.get('pupil_ellipse_frontal')
                         
                         # Extract pupil measurements from frontal view
                         if results.get('pupil_from_frontal'):
                             pupil_measurements = results['pupil_from_frontal']
+                            
+                            # Store pupil diameter from frontal view (perspective-corrected)
+                            if 'pupil_diameter_from_area_px' in pupil_measurements:
+                                csv_row['pupil_diameter_px'] = f"{pupil_measurements['pupil_diameter_from_area_px']:.2f}"
                         
                     except Exception as e:
                         print(f"⚠️  Iris unwrapping failed for frame {frame_num}: {e}")
@@ -494,14 +564,16 @@ class PipelineProcessor:
                         traceback.print_exc()
                         unwrapped_frontal = None
                         pupil_measurements = None
+                        iris_ellipse_frontal = None
+                        pupil_ellipse_frontal = None
                 
                 # Annotate original frame
                 t0 = time.perf_counter()
                 info_frame = frame.copy()
-                cv2.putText(info_frame, f"Frame: {frame_num}", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.putText(info_frame, "Original", (10, 60),
+                cv2.putText(info_frame, "Original", (10, 30),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                cv2.putText(info_frame, f"Frame: {frame_num}", (10, self.height - 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 
                 # Annotate detection result
                 status_text = "DETECTED" if pupil_data else "NOT DETECTED"
@@ -519,7 +591,38 @@ class PipelineProcessor:
                     if len(unwrapped_frontal.shape) == 2:
                         frontal_bgr = cv2.cvtColor(unwrapped_frontal, cv2.COLOR_GRAY2BGR)
                     else:
-                        frontal_bgr = unwrapped_frontal
+                        frontal_bgr = unwrapped_frontal.copy()
+                    
+                    # Draw transformed ellipses on frontal view (matches GUI behavior)
+                    # Draw iris ellipse (green)
+                    if iris_ellipse_frontal is not None:
+                        if isinstance(iris_ellipse_frontal, tuple) and len(iris_ellipse_frontal) == 3:
+                            center, axes, angle = iris_ellipse_frontal
+                            cv2.ellipse(frontal_bgr, 
+                                       (int(center[0]), int(center[1])), 
+                                       (int(axes[0]/2), int(axes[1]/2)),
+                                       angle, 0, 360, (0, 255, 0), 2)
+                        elif len(iris_ellipse_frontal) >= 5:
+                            cx, cy, a, b, angle = iris_ellipse_frontal
+                            cv2.ellipse(frontal_bgr, 
+                                       (int(cx), int(cy)), 
+                                       (int(a), int(b)),
+                                       np.rad2deg(angle), 0, 360, (0, 255, 0), 2)
+                    
+                    # Draw pupil ellipse (blue)
+                    if pupil_ellipse_frontal is not None:
+                        if isinstance(pupil_ellipse_frontal, tuple) and len(pupil_ellipse_frontal) == 3:
+                            center, axes, angle = pupil_ellipse_frontal
+                            cv2.ellipse(frontal_bgr, 
+                                       (int(center[0]), int(center[1])), 
+                                       (int(axes[0]/2), int(axes[1]/2)),
+                                       angle, 0, 360, (255, 0, 0), 2)
+                        elif len(pupil_ellipse_frontal) >= 5:
+                            cx, cy, a, b, angle = pupil_ellipse_frontal
+                            cv2.ellipse(frontal_bgr, 
+                                       (int(cx), int(cy)), 
+                                       (int(a), int(b)),
+                                       np.rad2deg(angle), 0, 360, (255, 0, 0), 2)
                     
                     frontal_resized = cv2.resize(frontal_bgr, (frontal_width, self.height))
                     
@@ -557,6 +660,18 @@ class PipelineProcessor:
                 
                 timing_stats['annotate'] += time.perf_counter() - t0
                 
+                # Write CSV row
+                csv_writer.writerow([
+                    csv_row['frame_id'],
+                    csv_row['pupil_x'], csv_row['pupil_y'], csv_row['pupil_diameter_px'],
+                    csv_row['iris_x'], csv_row['iris_y'],
+                    csv_row['pupil_ellipse_cx'], csv_row['pupil_ellipse_cy'], 
+                    csv_row['pupil_ellipse_a'], csv_row['pupil_ellipse_b'], csv_row['pupil_ellipse_angle'],
+                    csv_row['iris_ellipse_cx'], csv_row['iris_ellipse_cy'], 
+                    csv_row['iris_ellipse_a'], csv_row['iris_ellipse_b'], csv_row['iris_ellipse_angle'],
+                    csv_row['detected']
+                ])
+                
                 # Compose three views side-by-side
                 combined = np.hstack([info_frame, result_frame, frontal_resized])
                 
@@ -578,10 +693,14 @@ class PipelineProcessor:
         
         finally:
             out.release()
+            csv_file.close()
         
         # Print final report
         overall_time = time.perf_counter() - overall_start
         detection_rate = (detected_count / num_frames) * 100 if num_frames > 0 else 0
+        
+        print(f"\n📊 CSV data saved to: {csv_path}")
+        print(f"   {num_frames} rows written")
         
         self._print_timing_report(timing_stats, num_frames, overall_time, 
                                   detection_rate, detected_count, output_path)
