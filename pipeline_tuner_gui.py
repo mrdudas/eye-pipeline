@@ -343,6 +343,9 @@ class PipelineTunerGUI:
         ttk.Button(action_frame, text="🧪 Test on 100 Frames", 
                   command=lambda: self.run_test(100)).pack(fill=tk.X, pady=2)
         
+        ttk.Button(action_frame, text="🧪 Test on 1000 Frames", 
+                  command=lambda: self.run_test(1000)).pack(fill=tk.X, pady=2)
+        
         ttk.Button(action_frame, text="🎬 Process Full Video", 
                   command=self.process_full_video).pack(fill=tk.X, pady=2)
         

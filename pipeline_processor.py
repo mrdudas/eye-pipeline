@@ -689,7 +689,7 @@ class PipelineProcessor:
                     print(f"📊 Frame {idx+1}/{num_frames} | "
                           f"FPS: {fps_current:.2f} | "
                           f"Detected: {detected_count}/{idx+1} ({detection_rate:.1f}%) | "
-                          f"ETA: {eta:.1f}s")
+                          f"ETA: {eta:.1f}s", flush=True)
         
         finally:
             out.release()
