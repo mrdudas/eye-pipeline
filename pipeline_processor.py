@@ -776,8 +776,14 @@ Examples:
         else:
             num_frames = min(args.frames, processor.frame_count - args.start_frame)
         
-        # Process
+        # Process output path
         output_path = Path(args.output)
+        
+        # If output path is relative and doesn't exist, place it in the video's directory
+        if not output_path.is_absolute():
+            video_dir = Path(args.video).parent.resolve()
+            output_path = video_dir / output_path
+        
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
         processor.process_frames(args.start_frame, num_frames, output_path)

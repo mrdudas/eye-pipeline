@@ -1061,10 +1061,9 @@ class PipelineTunerGUI:
             import yaml
             yaml.dump(config_data, f)
         
-        # Output file
-        output_dir = Path("output")
-        output_dir.mkdir(exist_ok=True)
-        output_file = output_dir / f"test_frames_{start_frame}_to_{end_frame-1}.mp4"
+        # Output file - place in the same directory as the video
+        video_dir = Path(self.video_path).parent
+        output_file = video_dir / f"test_frames_{start_frame}_to_{end_frame-1}.mp4"
         
         # Build command
         cmd = [
